@@ -1,0 +1,14 @@
+# Runtime secrets and session state
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Build output
+bin/
+dist/
+*.exe
+
+# Local artifacts
+page-signup.png
+*.log

@@ -33,6 +33,14 @@ func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
 	}
 }
 
+// isContentError reports whether err is a property of the request content
+// rather than of the account or the transport: no other account can serve
+// the same prompt, so the request must fail fast and the account must not
+// be blamed for it.
+func isContentError(err error) bool {
+	return errors.Is(err, ErrUserMessageTooLarge) || errors.Is(err, ErrGuardrailBlocked)
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
@@ -220,12 +228,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			lastErr = err
-			if !errors.Is(err, ErrUserMessageTooLarge) && ctx.Err() == nil {
+			if !isContentError(err) && ctx.Err() == nil {
 				s.accounts.ReportFailure(ctx, acct.ID, err)
 			}
 			log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
 				id, attempt, maxAttempts, accountLogLabel(acct), err)
-			if errors.Is(err, ErrUserMessageTooLarge) {
+			if isContentError(err) {
 				break
 			}
 			if resume {
@@ -250,6 +258,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
 			case errors.Is(lastErr, ErrUserMessageTooLarge):
 				status, code = http.StatusBadRequest, "request_too_large"
+			case errors.Is(lastErr, ErrGuardrailBlocked):
+				// 502, not 429: the upstream refused the content, it is
+				// not rate limiting, and the router must fall back to
+				// the next model instead of backing off and retrying
+				// this one.
+				status, code = http.StatusBadGateway, "guardrail_blocked"
 			}
 			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
@@ -408,12 +422,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		lastErr = err
-		if !errors.Is(err, ErrUserMessageTooLarge) && ctx.Err() == nil {
+		if !isContentError(err) && ctx.Err() == nil {
 			s.accounts.ReportFailure(ctx, acct.ID, err)
 		}
 		log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
 			id, attempt, maxAttempts, accountLogLabel(acct), err)
-		if errors.Is(err, ErrUserMessageTooLarge) {
+		if isContentError(err) {
 			break
 		}
 		if resume && !started {
@@ -447,6 +461,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
 			case errors.Is(lastErr, ErrUserMessageTooLarge):
 				status, code = http.StatusBadRequest, "request_too_large"
+			case errors.Is(lastErr, ErrGuardrailBlocked):
+				// 502, not 429: the upstream refused the content, it is
+				// not rate limiting, and the router must fall back to
+				// the next model instead of backing off and retrying
+				// this one.
+				status, code = http.StatusBadGateway, "guardrail_blocked"
 			}
 			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())

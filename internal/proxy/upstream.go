@@ -28,6 +28,17 @@ const (
 // upstream 64 KB per-frame limit even after trimming older prompt text.
 var ErrUserMessageTooLarge = errors.New("user_message exceeds the upstream 64 KB frame limit")
 
+// ErrGuardrailBlocked means the upstream content filter (the AWS Quick
+// guardrail) refused the request. The model generated nothing: the turn
+// carries the filter's refusal text instead of a completion, with zero
+// usage. It is a property of the request content, not of the account: no
+// other account can serve the same prompt.
+var ErrGuardrailBlocked = errors.New("upstream guardrail blocked the request")
+
+// guardrailBlockMarker is the distinctive fragment of the refusal text the
+// upstream returns when its content filter blocks a request.
+const guardrailBlockMarker = "did not pass our automated check"
+
 type Upstream struct {
 	cfg *config.Config
 }
@@ -352,6 +363,8 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 	var result ChatResult
 	var text strings.Builder
 	sawMessageComplete := false
+	guardrailBlocked := false
+	guardrailDetail := ""
 	var completeDeadline time.Time
 	eventCounts := make(map[string]int)
 
@@ -433,6 +446,27 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 		if len(eventCounts) > 0 {
 			log.Printf("upstream events thread=%s counts=%v text_chars=%d tool_calls=%d",
 				threadID, eventCounts, text.Len(), len(toolOrder))
+		}
+		// A guardrail block is not a completion: the upstream refused the
+		// request and the model generated nothing. Return an error so the
+		// HTTP layer answers 502 and the router can fall back to the next
+		// model instead of serving the refusal text as an assistant reply.
+		if !guardrailBlocked && isGuardrailBlockText(result.Text) &&
+			result.Usage.CompletionTokens == 0 && result.Usage.TotalTokens == 0 {
+			// Secondary signal: no guardrail_blocked event was seen, but
+			// the turn carries the refusal text with zero usage. A real
+			// model response always reports usage, so this is a block.
+			guardrailBlocked = true
+		}
+		if guardrailBlocked {
+			detail := guardrailDetail
+			if detail == "" {
+				detail = truncateText(result.Text, 300)
+			}
+			if detail == "" {
+				detail = "no detail from upstream"
+			}
+			return result, fmt.Errorf("%w: %s", ErrGuardrailBlocked, detail)
 		}
 		return result, nil
 	}
@@ -682,6 +716,17 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			} else {
 				completeDeadline = time.Now().Add(5 * time.Second)
 			}
+		case "guardrail_blocked":
+			// The upstream content filter refused the request. The turn
+			// still ends normally (the refusal text arrives as text
+			// deltas), so only mark it here; finish() turns the whole
+			// turn into an error.
+			guardrailBlocked = true
+			if detail := errorText(env.Payload, env.Message, env.Code); detail != "" {
+				guardrailDetail = detail
+			}
+			log.Printf("upstream guardrail_blocked thread=%s detail=%q payload=%s",
+				threadID, guardrailDetail, truncateText(string(env.Payload), 500))
 		case "error", "session_error", "stream_error", "turn_failed":
 			res, _ := finish()
 			message := env.Message
@@ -695,7 +740,11 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			log.Printf("upstream %s error=%q code=%q payload=%s frame=%s",
 				env.Type, message, code,
 				truncateText(string(env.Payload), 1000), truncateText(jsonStr, 1500))
-			return res, fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, message, code))
+			detail := errorText(env.Payload, message, code)
+			if detail == "" {
+				detail = "unknown upstream error"
+			}
+			return res, fmt.Errorf("upstream %s: %s", env.Type, detail)
 		default:
 			if terminal[env.Type] {
 				return finish()
@@ -732,6 +781,17 @@ func deltaText(raw json.RawMessage) string {
 	return p.Text
 }
 
+// isGuardrailBlockText reports whether s is the refusal text the upstream
+// returns when its content filter blocks a request. It is only a secondary
+// signal and must be combined with zero usage (see finish()): a real model
+// response always reports usage, so a zero-usage turn carrying this text is
+// a block, not a completion that happens to quote the phrase.
+func isGuardrailBlockText(s string) bool {
+	return strings.Contains(strings.ToLower(s), guardrailBlockMarker)
+}
+
+// errorText extracts a human-readable detail from an upstream error event.
+// It returns "" when the event carries no detail.
 func errorText(raw json.RawMessage, fallback, code string) string {
 	if len(raw) > 0 {
 		var v any
@@ -752,7 +812,7 @@ func errorText(raw json.RawMessage, fallback, code string) string {
 			return s
 		}
 	}
-	return "unknown upstream error"
+	return ""
 }
 
 func nestedErrorText(v any) string {

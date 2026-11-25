@@ -215,6 +215,46 @@ func resolveToolName(name string, allowed map[string]bool) string {
 	return match
 }
 
+// isBatchWrapperName reports whether name is a generic wrapper the model uses
+// to batch several calls, rather than a real tool name.
+func isBatchWrapperName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "tool_call", "tool_calls", "function_call", "function_calls", "call", "calls", "invoke", "multi_tool", "parallel", "batch":
+		return true
+	}
+	return false
+}
+
+// nestedCallEnvelopes parses a "calls"/"tool_calls" array nested inside an
+// arguments object, e.g. {"calls":[{...}]}.
+func nestedCallEnvelopes(args json.RawMessage) []toolCallEnvelope {
+	args = json.RawMessage(strings.TrimSpace(string(args)))
+	if len(args) == 0 || args[0] != '{' {
+		return nil
+	}
+	var holder struct {
+		Calls     []toolCallEnvelope `json:"calls"`
+		ToolCalls []toolCallEnvelope `json:"tool_calls"`
+	}
+	if json.Unmarshal(args, &holder) != nil {
+		return nil
+	}
+	if len(holder.Calls) > 0 {
+		return holder.Calls
+	}
+	return holder.ToolCalls
+}
+
+// isJSONObjectOrArray reports whether s is valid JSON shaped as an object or
+// an array.
+func isJSONObjectOrArray(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" || (t[0] != '{' && t[0] != '[') {
+		return false
+	}
+	return json.Valid([]byte(t))
+}
+
 // parseToolEnvelopes accepts a single object, an array, an OpenAI tool_calls
 // wrapper, or a legacy function_call wrapper.
 func parseToolEnvelopes(payload string) []toolCallEnvelope {
@@ -248,6 +288,16 @@ func parseToolEnvelopes(payload string) []toolCallEnvelope {
 	}
 	var one toolCallEnvelope
 	if json.Unmarshal([]byte(payload), &one) == nil {
+		// The model sometimes batches several calls in one envelope:
+		// {"name":"tool_call","arguments":{"calls":[...]}}. The calls live
+		// inside arguments, so unwrap them before treating the object as a
+		// single call. Only generic wrapper names unwrap, so a real tool
+		// whose argument happens to be named "calls" is never misread.
+		if name, args := one.resolved(); isBatchWrapperName(name) {
+			if nested := nestedCallEnvelopes(args); len(nested) > 0 {
+				return nested
+			}
+		}
 		name, args := one.resolved()
 		if name != "" || len(args) > 0 {
 			return []toolCallEnvelope{one}
@@ -321,8 +371,10 @@ func findToolTag(text string) (start int, open, close string) {
 }
 
 // extractTaggedToolCalls removes valid tool markers and returns the remaining
-// text. Invalid or unknown markers are left untouched so ordinary text is
-// never lost.
+// text. A marker whose body is valid JSON but could not be used (unknown tool,
+// wrapper shape) is dropped as well: a <client_tool_call> block is machine
+// protocol, never prose, so leaking it to the user only shows raw markup.
+// Non-JSON bodies are left untouched so ordinary text is never lost.
 func extractTaggedToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply) {
 	var clean strings.Builder
 	var replies []ToolCallReply
@@ -344,6 +396,12 @@ func extractTaggedToolCalls(text string, allowed map[string]bool) (string, []Too
 		parsed := repliesFromEnvelopes(parseToolEnvelopes(rest[bodyStart:bodyEnd]), allowed)
 		if len(parsed) == 0 {
 			clearEnd := bodyEnd + len(close)
+			if isJSONObjectOrArray(rest[bodyStart:bodyEnd]) {
+				clean.WriteString(rest[:start])
+				changed = true
+				rest = rest[clearEnd:]
+				continue
+			}
 			clean.WriteString(rest[:clearEnd])
 			rest = rest[clearEnd:]
 			continue
@@ -439,7 +497,7 @@ func extractBareToolCall(text string, allowed map[string]bool) (string, []ToolCa
 
 func parseClientToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply) {
 	clean, replies := extractTaggedToolCalls(text, allowed)
-	if len(replies) > 0 {
+	if len(replies) > 0 || clean != text {
 		return dropEmptyFences(clean), replies
 	}
 	clean, replies = extractFencedToolCalls(text, allowed)

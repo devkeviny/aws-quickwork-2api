@@ -171,10 +171,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	startedAt := time.Now()
-	maxAttempts := s.maxAttempts(ctx)
-	if resume {
-		maxAttempts++
-	}
+	maxAttempts := s.maxAttempts()
 	attempts := 0
 	var usedAccount *store.Account
 	requestedModel := strings.TrimSpace(req.Model)
@@ -184,87 +181,182 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	log.Printf("chat %s start model=%s upstream_model=%s stream=%t messages=%d prompt_chars=%d system_chars=%d reuse=%t thread=%q",
 		id, requestedModel, model, req.Stream, len(req.Messages), len(promptText), len(systemPromptText), resume, in.ThreadID)
 
-	selectAccount := func(attempt int) (*store.Account, error) {
-		if resume && attempt == 1 && conv.accountID != 0 {
-			acct, err := s.accounts.NextPinned(ctx, conv.accountID)
-			if err == nil {
-				return acct, nil
+	resetConversation := func() {
+		conv.reset()
+		resume = false
+		in.ThreadID = ""
+		in.CreateSession = true
+		in.Prompt = prompt
+	}
+	responseOutput := func(result ChatResult) (string, []ToolCall) {
+		text := result.Text
+		var replies []ToolCallReply
+		if bridgeActive {
+			text, replies = parseClientToolCalls(text, allowedTools)
+			if len(replies) == 0 {
+				replies = nativeToolReplies(result.ToolCalls, allowedTools)
 			}
-			log.Printf("chat %s pinned account %d unavailable: %v; starting a new session",
-				id, conv.accountID, err)
-			conv.reset()
-			resume = false
-			in.ThreadID = ""
-			in.CreateSession = true
-			in.Prompt = prompt
+			replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
 		}
-		return s.accounts.Next(ctx)
+		return text, replyToolCalls(replies)
+	}
+	blockedAccounts := make(map[int64]bool)
+	attemptedAccounts := make(map[int64]bool)
+	refreshedAccounts := make(map[int64]bool)
+	pinnedFirst := resume && conv.accountID != 0
+	var preferredAccount int64
+	selectAccount := func() (*store.Account, *Session, error) {
+		for {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			var acct *store.Account
+			var selectErr error
+			if pinnedFirst || preferredAccount != 0 {
+				accountID := preferredAccount
+				preferredAccount = 0
+				if pinnedFirst {
+					accountID = conv.accountID
+					pinnedFirst = false
+				}
+				acct, selectErr = s.accounts.NextPinned(ctx, accountID)
+				if selectErr != nil {
+					blockedAccounts[accountID] = true
+					log.Printf("chat %s preferred account %d unavailable; selecting another account", id, accountID)
+					resetConversation()
+					continue
+				}
+			} else {
+				unavailable := make(map[int64]bool, len(blockedAccounts)+len(attemptedAccounts))
+				for accountID := range blockedAccounts {
+					unavailable[accountID] = true
+				}
+				for accountID := range attemptedAccounts {
+					unavailable[accountID] = true
+				}
+				acct, selectErr = s.accounts.NextExcluding(ctx, unavailable)
+				for accountID := range unavailable {
+					if !attemptedAccounts[accountID] {
+						blockedAccounts[accountID] = true
+					}
+				}
+				if errors.Is(selectErr, accounts.ErrNoAvailableAccounts) && len(attemptedAccounts) > 0 {
+					clear(attemptedAccounts)
+					acct, selectErr = s.accounts.NextExcluding(ctx, blockedAccounts)
+				}
+				if selectErr != nil {
+					return nil, nil, selectErr
+				}
+			}
+			sess := SessionFromAccount(acct, s.cfg)
+			if err := sess.validate(); err != nil {
+				blockedAccounts[acct.ID] = true
+				s.accounts.ReportFailure(ctx, acct.ID, err)
+				log.Printf("chat %s account=%s invalid_session error=%v", id, accountLogLabel(acct), err)
+				if resume {
+					resetConversation()
+				}
+				continue
+			}
+			return acct, sess, nil
+		}
+	}
+	runChat := func(onEvent EventFunc, streamStarted func() bool, resetOutput func()) (ChatResult, error) {
+		var res ChatResult
+		var lastErr error
+		for attempts < maxAttempts {
+			if attempts > 0 {
+				if err := waitForRetry(ctx, attempts); err != nil {
+					return res, err
+				}
+			}
+			acct, sess, err := selectAccount()
+			if err != nil {
+				if lastErr != nil && errors.Is(err, accounts.ErrNoAvailableAccounts) {
+					return res, lastErr
+				}
+				return res, err
+			}
+			if resetOutput != nil {
+				resetOutput()
+			}
+			usedAccount = acct
+			attemptedAccounts[acct.ID] = true
+			attempts++
+			log.Printf("chat %s attempt=%d/%d account=%s", id, attempts, maxAttempts, accountLogLabel(acct))
+			attemptStarted := time.Now()
+			res, err = s.upstream.Chat(ctx, sess, in, onEvent)
+			attemptDuration := time.Since(attemptStarted)
+			if err == nil {
+				text, toolCalls := responseOutput(res)
+				if !hasVisibleText(text) && len(toolCalls) == 0 {
+					err = fmt.Errorf("%w (completion_tokens=%d)", ErrEmptyResponse, res.Usage.CompletionTokens)
+				}
+			}
+			s.accounts.RecordCall(ctx, acct.ID, accounts.CallUsage{
+				Duration:         attemptDuration,
+				PromptTokens:     res.Usage.PromptTokens,
+				CompletionTokens: res.Usage.CompletionTokens,
+				TotalTokens:      res.Usage.TotalTokens,
+				CacheReadTokens:  res.Usage.CacheReadTokens,
+				CacheWriteTokens: res.Usage.CacheWriteTokens,
+				CostUSD:          res.Usage.CostUSD,
+				Credits:          res.Usage.Credits,
+				Success:          err == nil,
+			})
+			if err == nil {
+				return res, nil
+			}
+			lastErr = err
+			if !invalidChatRequest(err) && ctx.Err() == nil {
+				s.accounts.ReportFailure(ctx, acct.ID, err)
+			}
+			log.Printf("chat %s attempt=%d/%d account=%s failed error=%v", id, attempts, maxAttempts, accountLogLabel(acct), err)
+			if streamStarted != nil && streamStarted() {
+				log.Printf("chat %s stream already started; not retrying", id)
+				return res, err
+			}
+			if ctx.Err() != nil {
+				return res, ctx.Err()
+			}
+			action := retryActionFor(err)
+			if action == retryStop || attempts >= maxAttempts {
+				return res, err
+			}
+			wasResume := resume
+			resetConversation()
+			switch action {
+			case retryRefresh:
+				if refreshedAccounts[acct.ID] {
+					blockedAccounts[acct.ID] = true
+					break
+				}
+				refreshedAccounts[acct.ID] = true
+				refreshed, refreshErr := s.accounts.RefreshOne(ctx, acct.ID)
+				if refreshErr == nil && !refreshed.Disabled {
+					preferredAccount = acct.ID
+				} else {
+					blockedAccounts[acct.ID] = true
+				}
+			case retryNextAccount:
+				blockedAccounts[acct.ID] = true
+			case retryNewSession:
+				if wasResume {
+					preferredAccount = acct.ID
+					log.Printf("chat %s session resume failed; retrying with full transcript", id)
+				} else {
+					blockedAccounts[acct.ID] = true
+				}
+			}
+		}
+		return res, lastErr
 	}
 
 	if !req.Stream {
-		var res ChatResult
-		var lastErr error
-		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			attempts = attempt
-			acct, err := selectAccount(attempt)
-			if err != nil {
-				lastErr = err
-				log.Printf("chat %s attempt=%d/%d account=none error=%v", id, attempt, maxAttempts, err)
-				break
-			}
-			usedAccount = acct
-			sess := SessionFromAccount(acct, s.cfg)
-			if err := sess.validate(); err != nil {
-				s.accounts.ReportFailure(ctx, acct.ID, err)
-				lastErr = err
-				log.Printf("chat %s attempt=%d/%d account=%s invalid_session error=%v",
-					id, attempt, maxAttempts, accountLogLabel(acct), err)
-				continue
-			}
-			log.Printf("chat %s attempt=%d/%d account=%s", id, attempt, maxAttempts, accountLogLabel(acct))
-			res, err = s.upstream.Chat(ctx, sess, in, nil)
-			if err == nil {
-				lastErr = nil
-				break
-			}
-			lastErr = err
-			if !isContentError(err) && ctx.Err() == nil {
-				s.accounts.ReportFailure(ctx, acct.ID, err)
-			}
-			log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
-				id, attempt, maxAttempts, accountLogLabel(acct), err)
-			if isContentError(err) {
-				break
-			}
-			if resume {
-				conv.reset()
-				resume = false
-				in.ThreadID = ""
-				in.CreateSession = true
-				in.Prompt = prompt
-				log.Printf("chat %s session resume failed; retrying with full transcript", id)
-				continue
-			}
-			if ctx.Err() != nil {
-				log.Printf("chat %s request context ended: %v", id, ctx.Err())
-				break
-			}
-		}
+		res, lastErr := runChat(nil, nil, nil)
 		if lastErr != nil {
 			conv.reset()
-			status, code := http.StatusBadGateway, "upstream_error"
-			switch {
-			case errors.Is(lastErr, accounts.ErrNoAccounts):
-				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
-			case errors.Is(lastErr, ErrUserMessageTooLarge):
-				status, code = http.StatusBadRequest, "request_too_large"
-			case errors.Is(lastErr, ErrGuardrailBlocked):
-				// 502, not 429: the upstream refused the content, it is
-				// not rate limiting, and the router must fall back to
-				// the next model instead of backing off and retrying
-				// this one.
-				status, code = http.StatusBadGateway, "guardrail_blocked"
-			}
+			status, code := chatErrorStatus(lastErr)
 			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
@@ -275,22 +367,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			conv.messages = append([]Message(nil), req.Messages...)
 			conv.systemPrompt = systemPromptText
 		}
-		text := res.Text
-		var replies []ToolCallReply
-		if bridgeActive {
-			text, replies = parseClientToolCalls(text, allowedTools)
-			if len(replies) == 0 {
-				replies = nativeToolReplies(res.ToolCalls, allowedTools)
-			}
-			replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
-		}
-		toolCalls := replyToolCalls(replies)
-		if !hasVisibleText(text) && len(toolCalls) == 0 {
-			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
-			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", errEmpty.Error())
-			return
-		}
+		text, toolCalls := responseOutput(res)
 		message := map[string]any{"role": "assistant"}
 		if !hasVisibleText(text) {
 			message["content"] = nil
@@ -382,92 +459,33 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sawVisibleText := false
-	var bridgeBuffer strings.Builder
-
-	var res ChatResult
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		attempts = attempt
-		acct, err := selectAccount(attempt)
-		if err != nil {
-			lastErr = err
-			log.Printf("chat %s attempt=%d/%d account=none error=%v", id, attempt, maxAttempts, err)
-			break
-		}
-		usedAccount = acct
-		sess := SessionFromAccount(acct, s.cfg)
-		if err := sess.validate(); err != nil {
-			s.accounts.ReportFailure(ctx, acct.ID, err)
-			lastErr = err
-			log.Printf("chat %s attempt=%d/%d account=%s invalid_session error=%v",
-				id, attempt, maxAttempts, accountLogLabel(acct), err)
-			continue
-		}
-		log.Printf("chat %s attempt=%d/%d account=%s", id, attempt, maxAttempts, accountLogLabel(acct))
-		res, err = s.upstream.Chat(ctx, sess, in, func(ev StreamEvent) error {
-			if ev.Type == "text" && ev.Text != "" {
-				if bridgeActive {
-					bridgeBuffer.WriteString(ev.Text)
-					return nil
-				}
-				if hasVisibleText(ev.Text) {
-					sawVisibleText = true
-				}
-				writeChunk(map[string]any{"content": ev.Text}, nil)
-			}
+	var pendingText strings.Builder
+	res, lastErr := runChat(func(ev StreamEvent) error {
+		if ev.Type != "text" || ev.Text == "" || bridgeActive {
 			return nil
-		})
-		if err == nil {
-			lastErr = nil
-			break
 		}
-		lastErr = err
-		if !isContentError(err) && ctx.Err() == nil {
-			s.accounts.ReportFailure(ctx, acct.ID, err)
-		}
-		log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
-			id, attempt, maxAttempts, accountLogLabel(acct), err)
-		if isContentError(err) {
-			break
-		}
-		if resume && !started {
-			conv.reset()
-			resume = false
-			in.ThreadID = ""
-			in.CreateSession = true
-			in.Prompt = prompt
-			sawVisibleText = false
-			bridgeBuffer.Reset()
-			log.Printf("chat %s session resume failed; retrying with full transcript", id)
-			continue
-		}
-		if started || ctx.Err() != nil {
-			if started {
-				log.Printf("chat %s stream already started; not retrying", id)
+		if !sawVisibleText {
+			pendingText.WriteString(ev.Text)
+			if !hasVisibleText(pendingText.String()) {
+				return nil
 			}
-			break
+			sawVisibleText = true
+			writeChunk(map[string]any{"content": pendingText.String()}, nil)
+			pendingText.Reset()
+			return nil
 		}
-		// Nothing reached the client yet; reset per-attempt state and try
-		// the next account in rotation.
+		writeChunk(map[string]any{"content": ev.Text}, nil)
+		return nil
+	}, func() bool {
+		return started
+	}, func() {
 		sawVisibleText = false
-		bridgeBuffer.Reset()
-	}
+		pendingText.Reset()
+	})
 	if lastErr != nil {
 		conv.reset()
 		if !started {
-			status, code := http.StatusBadGateway, "upstream_error"
-			switch {
-			case errors.Is(lastErr, accounts.ErrNoAccounts):
-				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
-			case errors.Is(lastErr, ErrUserMessageTooLarge):
-				status, code = http.StatusBadRequest, "request_too_large"
-			case errors.Is(lastErr, ErrGuardrailBlocked):
-				// 502, not 429: the upstream refused the content, it is
-				// not rate limiting, and the router must fall back to
-				// the next model instead of backing off and retrying
-				// this one.
-				status, code = http.StatusBadGateway, "guardrail_blocked"
-			}
+			status, code := chatErrorStatus(lastErr)
 			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
@@ -488,32 +506,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var outTools []ToolCall
 	finish := "stop"
 	if bridgeActive {
-		// Assign to the outer variables: a `:=` here would shadow outText and
-		// drop the buffered answer, streaming a stop with usage but no content.
-		var replies []ToolCallReply
-		outText, replies = parseClientToolCalls(bridgeBuffer.String(), allowedTools)
-		if len(replies) == 0 {
-			replies = nativeToolReplies(res.ToolCalls, allowedTools)
-		}
-		replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
-		outTools = replyToolCalls(replies)
+		outText, outTools = responseOutput(res)
 		if len(outTools) > 0 {
 			finish = "tool_calls"
-		} else if !hasVisibleText(outText) {
-			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
-			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
-			writeStreamError(errEmpty.Error())
-			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			return
 		}
-	} else if !sawVisibleText {
-		errEmpty := fmt.Errorf("upstream returned no visible text (completion_tokens=%d)", res.Usage.CompletionTokens)
-		logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
-		writeStreamError(errEmpty.Error())
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
-		return
+	} else if !sawVisibleText && hasVisibleText(res.Text) {
+		outText = res.Text
 	}
 	if hasVisibleText(outText) {
 		writeChunk(map[string]any{"content": outText}, nil)
@@ -577,17 +575,10 @@ func logChatDone(id string, startedAt time.Time, in ChatInput, acct *store.Accou
 	log.Print(line)
 }
 
-func (s *Server) maxAttempts(ctx context.Context) int {
-	n, err := s.accounts.EnabledCount(ctx)
-	if err != nil || n < 1 {
-		return 1
-	}
+func (s *Server) maxAttempts() int {
 	max := s.cfg.MaxAttempts
 	if max < 1 {
 		max = 1
-	}
-	if n < max {
-		return n
 	}
 	return max
 }

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"quickwork-openai/internal/config"
+	"quickwork-openai/internal/store"
 )
 
 const (
@@ -73,14 +76,23 @@ type Usage struct {
 	TotalTokens      int
 	CacheReadTokens  int
 	CacheWriteTokens int
+	CostUSD          *float64
+	Credits          []store.CreditUsage
 }
 
 func (u *Usage) add(v Usage) {
-	u.PromptTokens += v.PromptTokens
-	u.CompletionTokens += v.CompletionTokens
-	u.TotalTokens += v.TotalTokens
-	u.CacheReadTokens += v.CacheReadTokens
-	u.CacheWriteTokens += v.CacheWriteTokens
+	u.PromptTokens += max(v.PromptTokens, 0)
+	u.CompletionTokens += max(v.CompletionTokens, 0)
+	u.TotalTokens += max(v.PromptTokens, 0) + max(v.CompletionTokens, 0)
+	u.CacheReadTokens += max(v.CacheReadTokens, 0)
+	u.CacheWriteTokens += max(v.CacheWriteTokens, 0)
+	if v.CostUSD != nil && *v.CostUSD >= 0 && !math.IsNaN(*v.CostUSD) && !math.IsInf(*v.CostUSD, 0) {
+		if u.CostUSD == nil {
+			value := 0.0
+			u.CostUSD = &value
+		}
+		*u.CostUSD += *v.CostUSD
+	}
 }
 
 // StreamEvent is a text delta or a native tool call from the upstream agent.
@@ -126,10 +138,12 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		detail := ""
+		status := 0
 		if resp != nil {
+			status = resp.StatusCode
 			detail = fmt.Sprintf(" HTTP %d", resp.StatusCode)
 		}
-		return ChatResult{}, fmt.Errorf("upstream WebSocket dial failed%s: %w", detail, err)
+		return ChatResult{}, &UpstreamError{StatusCode: status, Err: fmt.Errorf("upstream WebSocket dial failed%s: %w", detail, err)}
 	}
 	defer conn.Close()
 
@@ -365,12 +379,19 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 	sawMessageComplete := false
 	guardrailBlocked := false
 	guardrailDetail := ""
+	turnComplete := false
 	var completeDeadline time.Time
 	eventCounts := make(map[string]int)
 
 	toolCalls := make(map[string]*ToolCallState)
 	toolOrder := make([]string, 0, 2)
 	toolSent := make(map[string]bool)
+	type creditSnapshot struct {
+		unit   string
+		amount *float64
+	}
+	creditSnapshots := make(map[string]creditSnapshot)
+	currentMessageID := "turn"
 	rawArgs := make(map[string]string)
 	argsPartial := make(map[string]bool)
 
@@ -423,6 +444,21 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 
 	finish := func() (ChatResult, error) {
 		result.Text = text.String()
+		creditTotals := make(map[string]float64)
+		for _, credit := range creditSnapshots {
+			if credit.amount != nil {
+				creditTotals[credit.unit] += *credit.amount
+			}
+		}
+		units := make([]string, 0, len(creditTotals))
+		for unit := range creditTotals {
+			units = append(units, unit)
+		}
+		sort.Strings(units)
+		result.Usage.Credits = result.Usage.Credits[:0]
+		for _, unit := range units {
+			result.Usage.Credits = append(result.Usage.Credits, store.CreditUsage{Unit: unit, Amount: creditTotals[unit]})
+		}
 		result.ToolCalls = result.ToolCalls[:0]
 		for _, id := range toolOrder {
 			tc := toolCalls[id]
@@ -473,7 +509,6 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 
 	terminal := map[string]bool{
 		"turn_completed": true,
-		"turn_aborted":   true,
 		"turn_ended":     true,
 		"stream_ended":   true,
 		"chat_complete":  true,
@@ -487,7 +522,7 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 		default:
 		}
 		readWait := 2 * time.Minute
-		if !completeDeadline.IsZero() {
+		if turnComplete && !completeDeadline.IsZero() {
 			if remaining := time.Until(completeDeadline); remaining > 0 {
 				readWait = remaining
 			} else {
@@ -502,7 +537,7 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				if emitErr != nil {
 					return res, emitErr
 				}
-				if text.Len() > 0 || len(toolOrder) > 0 {
+				if turnComplete {
 					return res, nil
 				}
 				return res, fmt.Errorf("upstream WebSocket read: %w", err)
@@ -529,6 +564,9 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				pendingFrames = append(pendingFrames, frames...)
 			}
 		}
+		if len(pendingFrames) == 0 {
+			continue
+		}
 		jsonStr := pendingFrames[0]
 		pendingFrames = pendingFrames[1:]
 
@@ -546,11 +584,61 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 		}
 		eventCounts[env.Type]++
 		switch env.Type {
+		case "message_start":
+			turnComplete = false
+			completeDeadline = time.Time{}
+			var payload struct {
+				MessageID string `json:"message_id"`
+				ID        string `json:"id"`
+			}
+			_ = json.Unmarshal(env.Payload, &payload)
+			if env.MessageID != "" {
+				currentMessageID = env.MessageID
+			} else if payload.MessageID != "" {
+				currentMessageID = payload.MessageID
+			} else if payload.ID != "" {
+				currentMessageID = payload.ID
+			}
+		case "acp_metadata":
+			var payload struct {
+				CostValue *float64 `json:"cost_value"`
+				CostUnit  *string  `json:"cost_unit_plural"`
+				MessageID string   `json:"message_id"`
+			}
+			if err := json.Unmarshal(env.Payload, &payload); err != nil {
+				continue
+			}
+			messageID := currentMessageID
+			if env.MessageID != "" {
+				messageID = env.MessageID
+			} else if payload.MessageID != "" {
+				messageID = payload.MessageID
+			}
+			credit := creditSnapshots[messageID]
+			if payload.CostUnit != nil {
+				unit := strings.TrimSpace(*payload.CostUnit)
+				if len(unit) > 128 || strings.ContainsAny(unit, "\r\n\t\x00") {
+					continue
+				}
+				credit.unit = unit
+			}
+			if credit.unit == "" {
+				credit.unit = "credits"
+			}
+			if payload.CostValue != nil {
+				if *payload.CostValue < 0 || math.IsNaN(*payload.CostValue) || math.IsInf(*payload.CostValue, 0) {
+					continue
+				}
+				credit.amount = payload.CostValue
+			}
+			creditSnapshots[messageID] = credit
 		case "text_delta":
 			delta := deltaText(env.Payload)
 			if delta == "" {
 				continue
 			}
+			turnComplete = false
+			completeDeadline = time.Time{}
 			text.WriteString(delta)
 			if onEvent != nil {
 				if err := onEvent(StreamEvent{Type: "text", Text: delta}); err != nil {
@@ -577,11 +665,12 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			sawMessageComplete = true
 		case "turn_usage":
 			var p struct {
-				InputTokens      int `json:"input_tokens"`
-				OutputTokens     int `json:"output_tokens"`
-				TotalTokens      int `json:"total_tokens"`
-				CacheReadTokens  int `json:"cache_read_tokens"`
-				CacheWriteTokens int `json:"cache_write_tokens"`
+				InputTokens      int      `json:"input_tokens"`
+				OutputTokens     int      `json:"output_tokens"`
+				TotalTokens      int      `json:"total_tokens"`
+				CacheReadTokens  int      `json:"cache_read_tokens"`
+				CacheWriteTokens int      `json:"cache_write_tokens"`
+				CostUSD          *float64 `json:"cost_usd"`
 			}
 			if err := json.Unmarshal(env.Payload, &p); err == nil {
 				result.Usage.add(Usage{
@@ -590,9 +679,14 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 					TotalTokens:      p.TotalTokens,
 					CacheReadTokens:  p.CacheReadTokens,
 					CacheWriteTokens: p.CacheWriteTokens,
+					CostUSD:          p.CostUSD,
 				})
 			}
 		case "tool_start", "tool_arguments", "tool_arguments_edited":
+			if env.Type == "tool_start" {
+				turnComplete = false
+				completeDeadline = time.Time{}
+			}
 			var p struct {
 				ToolName   string          `json:"tool_name"`
 				ToolID     string          `json:"tool_id"`
@@ -712,8 +806,10 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				}
 			}
 			if p.ContinuationExpected {
+				turnComplete = false
 				completeDeadline = time.Time{}
 			} else {
+				turnComplete = true
 				completeDeadline = time.Now().Add(5 * time.Second)
 			}
 		case "guardrail_blocked":
@@ -727,6 +823,9 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			}
 			log.Printf("upstream guardrail_blocked thread=%s detail=%q payload=%s",
 				threadID, guardrailDetail, truncateText(string(env.Payload), 500))
+		case "turn_aborted":
+			res, _ := finish()
+			return res, &UpstreamError{Code: "turn_aborted", Err: errors.New("upstream turn was aborted")}
 		case "error", "session_error", "stream_error", "turn_failed":
 			res, _ := finish()
 			message := env.Message
@@ -737,14 +836,25 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			if code == "" {
 				code = env.ErrorCode
 			}
-			log.Printf("upstream %s error=%q code=%q payload=%s frame=%s",
-				env.Type, message, code,
-				truncateText(string(env.Payload), 1000), truncateText(jsonStr, 1500))
-			detail := errorText(env.Payload, message, code)
-			if detail == "" {
-				detail = "unknown upstream error"
+			var detail struct {
+				Code       string `json:"code"`
+				ErrorCode  string `json:"error_code"`
+				StatusCode int    `json:"status_code"`
+				Status     int    `json:"status"`
 			}
-			return res, fmt.Errorf("upstream %s: %s", env.Type, detail)
+			_ = json.Unmarshal(env.Payload, &detail)
+			if code == "" {
+				code = detail.Code
+				if code == "" {
+					code = detail.ErrorCode
+				}
+			}
+			status := detail.StatusCode
+			if status == 0 {
+				status = detail.Status
+			}
+			log.Printf("upstream %s code=%q status=%d", env.Type, code, status)
+			return res, &UpstreamError{StatusCode: status, Code: code, Err: fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, message, code))}
 		default:
 			if terminal[env.Type] {
 				return finish()

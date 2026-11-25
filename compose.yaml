@@ -1,0 +1,23 @@
+services:
+  quickproxy:
+    image: quickwork-openai:local
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      QUICKPROXY_ADMIN_PASSWORD: "${QUICKPROXY_ADMIN_PASSWORD:?Set QUICKPROXY_ADMIN_PASSWORD to a password of at least 12 characters}"
+    ports:
+      - "127.0.0.1:${QUICKPROXY_PORT:-8080}:8080"
+    volumes:
+      - quickproxy-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
+
+volumes:
+  quickproxy-data:

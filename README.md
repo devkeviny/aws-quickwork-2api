@@ -1,98 +1,93 @@
 # QuickWork / Amazon Quick → OpenAI API
 
-把 Amazon Quick（QuickWork）桌面端的聊天能力转换成 **OpenAI 兼容的 HTTP API**。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-项目是单一 Go 可执行文件：原生 OAuth 登录、账号存储、token 刷新和反代全部由 Go 完成，不需要 Python，也不用启动官方桌面应用或 outpost 进程。登录后由反代把 `/v1/chat/completions` 请求转换为 QuickWork WebSocket 帧，并把结果转回普通 JSON 或 SSE。
+Expose Amazon Quick (QuickWork) chat through an **OpenAI-compatible HTTP API**.
 
-> 非官方项目，与 Amazon / AWS 无关联。请仅在你拥有或获得明确授权的账号上使用，并遵守相关服务条款。
+A single Go executable handles native OAuth / PKCE login, SQLite account storage, token refresh, account rotation, the proxy, and an embedded WebUI. No Python, Node.js, npm, official desktop application, or outpost process is required. The proxy converts `/v1/chat/completions` requests into QuickWork WebSocket frames and returns JSON or SSE responses.
 
-## 功能
+> This is an unofficial project, unaffiliated with Amazon / AWS. Use only accounts you own or are explicitly authorized to access, and comply with applicable terms of service.
 
-- `POST /v1/chat/completions`，支持流式（SSE）与非流式响应
-- `GET /v1/models`，返回本地模型别名
-- 原生 social 登录（AWS IAM Identity Center OIDC）与企业 OIDC 登录，使用 PKCE
-- 支持服务器/远程登录：手动粘贴浏览器 callback URL，无需开放本地回调端口
-- 服务端配置集中存放在 `config.json`
-- 账号存放在 SQLite（`data/quickwork.db`），支持多账号轮询与自动刷新
-- 请求按轮询选择账号；到期 token 自动 refresh；失败时切换到下一个账号重试
-- 可选本地 API key 保护
-- 默认复用上游会话（`session_reuse=true`）；设为 `false` 时每轮结束删除会话，避免污染聊天列表
-- 会话复用：同一段对话固定上游 thread 与账号，每轮只送新增消息，避免重送整份 transcript 撞 64 KB 上限；可用 `X-Conversation-Id` / `X-Thread-Id` 显式指定会话
-- 客户端 `tools` / `functions` 通过 `<caller_tool_interface>` 文本协议桥接；代理解析 `<client_tool_call>` 并返回 OpenAI `tool_calls`，实际执行仍在客户端
-- 工具桥接兼容多种模型写法：`arguments` / `parameters` / `input` / `args`、`tool_calls` / `tool_call` / `function_call`、Markdown 代码块、`functions.` 等命名空间前缀、大小写与唯一后缀匹配；支持同一轮并行多个工具调用
-- 历史中的 `assistant.tool_calls` / `role: tool` 仍会按文本渲染，供上游理解已有上下文
-- 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
-- `system` / `developer` 消息与工具定义放在本轮 user 文本开头的 `[System instructions from the API caller]` 区块内；上游会忽略每轮 `system_prompt` 字段，并把 `custom_prompt` 当作低信任的个人偏好，user 轮次是唯一可靠送达调用方指令的通道
-- 64 KB 单帧预算按实际 JSON 字节计算：用户内容过大时优先走 out-of-band 附件（`upload-attachment` → DLP 扫描 → `files/upload`），WebSocket 只发送短引用与 `attachments` 元数据；附件只包含用户内容，调用方指令仍留在 WS 文本里。附件不可用时才裁剪、保留开头与结尾，避免直接返回 `request_too_large`
-- `chat_agent_id` 可指定一个 QuickWork 自定义 agent，以替代默认内置 agent 的提示词与工具策略
+## Features
 
-## 环境要求
+- `POST /v1/chat/completions` with streaming SSE and non-streaming responses.
+- `GET /v1/models` listing configured local model aliases.
+- Native social and enterprise OAuth / PKCE login; manual callback submission works on remote servers without an accessible callback port.
+- SQLite accounts with round-robin selection, automatic token refresh, and classified retries before streaming begins, including single-account temporary-failure recovery.
+- Optional inference API keys, separate from WebUI administrator authentication.
+- Embedded English / Simplified Chinese WebUI: overview, account management, browser-based remote login, configuration editing, and a non-streaming Playground.
+- Management sessions with HttpOnly cookies, CSRF protection, origin checks, and login rate limiting.
+- Multi-stage Docker image and hardened Compose deployment with persistent configuration and accounts.
+- Upstream session reuse with pinned accounts and incremental conversation history; explicit `X-Conversation-Id` / `X-Thread-Id` support.
+- Client-side tool bridging for `tools`, `functions`, `tool_choice`, and parallel calls. The proxy returns OpenAI `tool_calls`; it never executes tools.
+- Upstream usage reporting, including `prompt_tokens_details.cached_tokens`.
+- Persistent per-account upstream attempt counts, cumulative attempt time, official token / USD / ACP credit reports, and manual or scheduled official monthly-minute quota sync.
+- Oversized user messages use upstream attachments with DLP checks when available, falling back to byte-budgeted middle truncation.
+- Optional `chat_agent_id` to select a custom QuickWork agent instead of the default agent's prompt and tool policy.
 
-- Go 1.26+（仅构建时需要）
-- 一个可正常登录的 Amazon Quick 账号
-- 浏览器与 `quickproxy login` 运行在**同一台机器**，且本机回调端口（默认 `18080`）可被浏览器访问
+## Requirements
 
-## 快速开始
+- Go **1.26.3+** for a native build. Docker builds include the Go toolchain.
+- An Amazon Quick account that can sign in normally.
+- A browser. Automatic CLI callbacks require it to reach the CLI machine's callback port, normally `18080`; WebUI and `login -manual` do not.
 
-### 1. 构建
+## Quick Start
+
+### 1. Build
 
 ```bash
-cd quickwork-openai
-go build -o bin/quickproxy.exe ./cmd/quickproxy   # Windows
-# go build -o bin/quickproxy ./cmd/quickproxy     # macOS / Linux
+go build -o bin/quickproxy.exe ./cmd/quickproxy
 ```
 
-### 2. 登录上游账号
+On macOS / Linux, use `-o bin/quickproxy`. The remaining examples use that executable name; on Windows, use `quickproxy.exe` where needed.
+
+### 2. Sign In to an Upstream Account
 
 ```bash
 ./bin/quickproxy login --provider social
 ```
 
-首次运行会在当前目录创建 `config.json`，并在 `data/quickwork.db` 初始化 SQLite。终端会打印一个 discovery URL，例如：
+First use creates `config.json` and initializes `data/quickwork.db`. Open the discovery URL printed by the command in a browser on the same machine and complete sign-in. The CLI receives callbacks, exchanges tokens, retrieves user information, and stores the account. It reports account information and expiry without printing tokens.
 
-```
-https://quick.aws.com/sn?qwSurface=desktop:<nonce>:18080:1.2.4660
-```
-
-在**同一台机器**的浏览器中打开它，完成登录。工具会接收浏览器回调、完成 OAuth / PKCE、交换 token、获取用户信息，并把账号写入 SQLite。完成后终端只打印账号显示信息、`ws_host` 和到期时间，不打印 token。
-
-企业 SSO 登录：
+For enterprise SSO:
 
 ```bash
 ./bin/quickproxy login --provider enterprise --region us-east-1
 ```
 
-需要登录多个账号时，重复执行 `login` 即可。相同 email + tenant 的账号会更新，不会重复插入。
+Repeat the login command for additional accounts. An existing account with the same email and tenant is updated rather than duplicated. You can also start the server without accounts and add them through the WebUI.
 
-#### 服务器 / 远程登录（手动回填 callback URL）
-
-如果 `quickproxy` 跑在服务器上，浏览器访问不到服务器的 `localhost:18080`，使用手动模式：
+#### Remote / Manual Login
 
 ```bash
 ./bin/quickproxy login -manual
 ```
 
-流程：
+1. Open the printed discovery URL in any browser and sign in.
+2. When redirected to `http://localhost:18080/callback?...`, copy the **complete address-bar URL** and paste it into the terminal. The callback page may fail to load; that is expected.
+3. Open the returned authorize URL and finish authorization.
+4. Copy the final `http://127.0.0.1:18080/?code=...&state=...` URL into the terminal.
+5. The account is saved to SQLite.
 
-1. 终端打印 discovery URL，在任意机器用浏览器打开并登录。
-2. 浏览器会跳转到 `http://localhost:18080/callback?...`。这个页面可能打不开，属正常现象；从地址栏复制**完整 URL**，粘贴回终端。
-3. 终端会打印 authorize URL；继续在浏览器打开并完成登录。
-4. 浏览器会跳转到 `http://127.0.0.1:18080/?code=...`；同样复制地址栏的完整 URL，粘贴回终端。
-5. 工具完成 token 交换并写入 SQLite。
+The CLI distinguishes discovery, authorization, and final callbacks by their parameters. It recognizes duplicate discovery callbacks, pasted authorize/discovery URLs, and fragment parameters without repeatedly registering the OAuth client. No callback port needs to be reachable on the server; the port is only part of the generated browser URL. Callback input can also be supplied through stdin.
 
-工具会根据 URL 参数自动判断阶段：`nonce=...` 是 discovery callback，`code=...&state=...` 是授权完成 callback。贴入 authorize URL、discovery URL、重复的 discovery callback 或带 fragment 的 callback 都会被识别并提示下一步，不会重复注册 OAuth client。
+### 3. Start the Server
 
-整个过程不需要服务器开放回调端口；回调端口只用于生成浏览器地址。也可以把 callback URL 通过 stdin 管道传入，便于脚本化。
-
-### 3. 启动反代
+Configure the `QUICKPROXY_ADMIN_PASSWORD` environment variable in the server's process environment before starting it. Use a distinct administrator password of **12–1024 bytes**; do not place it in documentation, command history, or `config.json`.
 
 ```bash
 ./bin/quickproxy server
 ```
 
-服务读取当前目录的 `config.json`。默认监听 `127.0.0.1:8080`。如果 `api_keys` 为空，代理关闭 API key 鉴权，适合纯本机使用。
+The default address is `127.0.0.1:8080`. Open `http://127.0.0.1:8080/` for the WebUI. Without the administrator password, management login is disabled but the inference API remains available. An empty `api_keys` list disables inference authentication and is suitable only for trusted local access.
 
-### 4. 调用
+Override the address for one run without modifying the configuration file:
+
+```bash
+./bin/quickproxy server -addr 127.0.0.1:8090
+```
+
+### 4. Call the API
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
@@ -106,16 +101,17 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{
     "model": "smart",
     "stream": true,
-    "messages": [{"role": "user", "content": "用三句话解释 QUIC"}]
+    "messages": [{"role": "user", "content": "Explain QUIC in three sentences."}]
   }'
 ```
 
-Python SDK：
+When `api_keys` is empty, `local` can be any value. If keys are configured, replace it with an allowed inference key. `X-Api-Key` is also supported.
+
+With the OpenAI Python SDK:
 
 ```python
 from openai import OpenAI
 
-# api_keys 为空时 api_key 可填任意值；配置后填对应 key。
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
 
 for chunk in client.chat.completions.create(
@@ -126,9 +122,110 @@ for chunk in client.chat.completions.create(
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-## 配置 `config.json`
+## Docker / Compose
 
-`quickproxy server` / `login` 在文件不存在时会写入默认配置。完整示例：
+The repository includes a multi-stage `Dockerfile`, `compose.yaml`, and an allowlist-based `.dockerignore`. Only module files, required Go sources, and embedded UI assets enter the build context—not local configuration, databases, or login state.
+
+Set `QUICKPROXY_ADMIN_PASSWORD` in your deployment environment first, then run:
+
+```bash
+docker compose up -d --build
+```
+
+Open `http://127.0.0.1:8080/`, sign in with the administrator password, and add upstream accounts from the Accounts page. `QUICKPROXY_PORT` changes the published host port; the container still listens on `0.0.0.0:8080`. Compose publishes to the host's loopback interface by default.
+
+Deployment details:
+
+- Named volume `quickproxy-data` mounts at `/app/data`; first use creates `/app/data/config.json`.
+- Relative database paths resolve against the configuration directory. The default database is therefore **`/app/data/data/quickwork.db`**. Set `database` to `quickwork.db` and restart to use `/app/data/quickwork.db` instead.
+- Existing configuration and account data survive image rebuilds and restarts. Do not remove the volume during upgrades.
+- The process runs as UID/GID `10001:10001`. A bind-mounted data directory must already be writable by this user.
+- Compose uses a read-only root filesystem, drops all Linux capabilities, enables `no-new-privileges`, and provides a temporary `/tmp`.
+- The health check calls only `/healthz` inside the container; it does not contact the upstream service or require accounts.
+- There is no default inference API key. Configure `api_keys` before permitting remote access, and use a TLS reverse proxy with access controls rather than directly exposing the management interface.
+
+Optional manual CLI login inside the running container:
+
+```bash
+docker compose exec quickproxy /app/quickproxy login -manual -config /app/data/config.json
+docker compose exec quickproxy /app/quickproxy accounts -config /app/data/config.json
+```
+
+Configuration saved through the WebUI takes effect after a restart:
+
+```bash
+docker compose restart quickproxy
+```
+
+To build the image separately:
+
+```bash
+docker build -t quickwork-openai:local .
+```
+
+## WebUI
+
+The embedded WebUI uses the same listener as the inference API. Set `webui.enabled` to `false` and restart to disable both the UI and management API without disabling inference.
+
+### Authentication and Languages
+
+- The administrator password comes only from `QUICKPROXY_ADMIN_PASSWORD`; it is not stored in configuration and is independent of inference API keys.
+- Management sessions use HttpOnly, SameSite=Strict cookies. Mutations require CSRF validation and origin checks; login attempts are rate-limited.
+- `webui.session_ttl` defaults to `12h`. Restarting the service invalidates sessions.
+- The language selector switches between **English** and **简体中文**. UI language does not change account settings, models, or the upstream `locale` configuration.
+- Management endpoints use unversioned `/api/` paths and do not inherit the inference API's wildcard CORS policy. Inference API keys do not grant management access.
+
+### Pages
+
+- **Overview:** process start time, models, account availability, real upstream call outcomes, cumulative attempt time, reported tokens, USD costs, and ACP credits grouped by unit. Legacy selection counts remain separate.
+- **Accounts:** per-account call / duration / token / cost / credit statistics and official monthly-minute quotas, alongside non-secret account information, enable/disable rotation, token refresh, and confirmed local deletion. Quota synchronization is separate from token refresh. Deletion does not revoke upstream authorization.
+- **Add Account:** the existing two-stage OAuth / PKCE flow, using pasted browser callbacks without requiring server or container callback-port access.
+- **Configuration:** edit JSON and save it to disk. The running configuration is not hot-reloaded; restart the service to apply changes. Inference keys are never returned to the browser. Leave the replacement field empty to preserve existing keys; explicitly choose clear to remove all keys.
+- **Playground:** non-streaming chat requests. Supply an inference API key separately if configured; the administrator password cannot authenticate inference. Secrets are not persisted in browser storage.
+
+### Add an Account in the Browser
+
+1. Choose a provider and build stage on the Accounts page; enter a region when needed.
+2. Start login, open the discovery link, and sign in.
+3. Copy the complete `localhost` callback URL from the browser address bar and submit it to the WebUI. An unreachable callback page is expected on a remote machine.
+4. Open the returned authorize link, finish authorization, and submit the final complete callback URL containing `code` and `state`.
+5. The account is stored in SQLite and the list updates. Cancel an unfinished flow or restart it after expiry.
+
+Callback URLs contain temporary authorization data: do not share them in chat, logs, or issue reports. Account tokens, refresh tokens, and client secrets are not returned by the management API.
+
+### Account Statistics and Official Usage
+
+The Accounts page distinguishes local attempt statistics from separately synchronized official allowances:
+
+- **Calls:** each real `Upstream.Chat` attempt counts once, including failed attempts and retries. A successful attempt returns visible text or valid tool calls. Legacy `use_count` records account selections, not actual calls.
+- **Time:** `total_duration_ms` sums each attempt's wall-clock time. Token refresh, retry backoff, and other non-chat work are excluded. It is not an account's lifetime or logged-in duration.
+- **Tokens:** input, output, total, cache-read, and cache-write counts come only from official WebSocket `turn_usage`. Unreported usage is not estimated. Statistics begin at `stats_since`; history before this feature is not reconstructed.
+- **USD:** `cost_usd` uses official `turn_usage` cost reports only. It may be unknown or cover only some calls; `cost_reported_calls` shows that coverage. A numeric zero means an explicit recorded zero, not an unknown cost.
+- **Credits:** official `acp_metadata` provides `cost_value` and `cost_unit_plural` (default unit: `credits`). Assistant-message snapshots replace earlier reports for that message instead of double-counting repeated frames. Totals are accumulated separately for each unit, with `reported_calls` coverage; different units are never added together. Ordinary `smart` / `fast` traffic may not send ACP metadata. An empty credits list means **Credits not reported**, not zero. Reported usage from failed or retried attempts is still counted.
+- **Monthly quota:** the official profile / usage source reports **minutes**, separately for the normal monthly allowance and monthly overage. Used, limit, and remaining values can be unknown. A missing overage limit must not be treated as zero; the plan may be uncapped. Remaining minutes are derived only when valid used and limit values exist, never from token counts or USD.
+
+**Credits, USD, tokens, and monthly minutes are different measurements. The proxy does not convert between them or infer a credit balance from local calls.**
+
+Use **Sync usage** for one account or **Sync all usage** for the enabled-account batch. A sync updates the official quota snapshot; it does not change recorded chat tokens, costs, or credits. The UI displays the last successful sync, latest attempt, reset time, and `unknown` / `available` / `stale` / `error` / `unsupported` status. Failed synchronization keeps the previous successful snapshot when one exists and marks it stale, rather than replacing it with zero.
+
+Automatic synchronization runs at startup and then every `usage.refresh_interval` for enabled accounts, defaulting to five minutes. `usage.enabled=false` disables only automatic synchronization; manual actions remain available. `usage.max_attempts` limits retries for temporary official-usage failures. The Accounts page shows the effective scheduler settings and next run; edit `usage` in Settings, save, and restart to apply changes.
+
+The official profile transport is implemented from confirmed source behavior, but **has not been validated with a live request in this change**. Providers and subscription plans may omit or reject these endpoints. Unavailable / unsupported responses remain unknown; no quota or credit values are fabricated.
+
+Management endpoints require the management session and CSRF header for writes:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/accounts` | Account details with `usage` statistics and cached `quota` snapshots |
+| `GET /api/status` | Aggregate calls / time / reported usage and effective `usage_sync` scheduler state |
+| `POST /api/accounts/{id}/usage/refresh` | Synchronize one account's official quota; returns `{quota: ...}` |
+| `POST /api/accounts/usage/refresh` | Synchronize enabled accounts; returns per-account results |
+
+Individual sync errors use `usage_unavailable`, `usage_unauthorized`, `usage_failed`, or `usage_busy`; the table reloads after success or failure so retained / stale snapshots stay visible. These endpoints do not expose account tokens or raw upstream response bodies.
+
+## Configuration
+
+Commands create `config.json` with defaults if it does not exist. Relative database paths are resolved against its directory.
 
 ```json
 {
@@ -151,6 +248,15 @@ for chunk in client.chat.completions.create(
   "keep_sessions": false,
   "session_reuse": true,
   "session_ttl": "30m",
+  "webui": {
+    "enabled": true,
+    "session_ttl": "12h"
+  },
+  "usage": {
+    "enabled": true,
+    "refresh_interval": "5m",
+    "max_attempts": 3
+  },
   "oauth": {
     "provider": "social",
     "build_stage": "prod",
@@ -161,218 +267,170 @@ for chunk in client.chat.completions.create(
 }
 ```
 
-| 字段 | 默认 | 说明 |
+| Field | Default | Meaning |
 |---|---|---|
-| `addr` | `127.0.0.1:8080` | HTTP 监听地址 |
-| `database` | `data/quickwork.db` | SQLite 文件；相对路径基于 `config.json` 所在目录 |
-| `api_keys` | `[]` | 允许的本地 API key；为空时关闭鉴权 |
-| `models` | `smart,fast,balanced,auto` | `/v1/models` 返回值与 model 白名单 |
-| `default_model` | `smart` | 未知 model 的映射 |
-| `request_timeout` | `5m` | 单次上游请求超时 |
-| `refresh_before` | `10m` | token 距离到期小于该值时自动 refresh |
-| `max_attempts` | `3` | 单次请求最多尝试的账号数 |
-| `app_version` | `1.2.4660` | 上游握手使用的 appVersion |
-| `surface` | `QUICK_WORK_DESKTOP_WINDOWS` | 上游握手使用的 surfaceType |
-| `outpost_id` / `working_session_id` | 空 | 上游握手可选字段 |
-| `timezone` / `locale` | `UTC` / `en-US` | `user_message` 中的时区与语言 |
-| `thinking_effort` | 空 | `off`、`low`、`medium`、`high`；空=服务端默认，`off` 会显式发送关闭 |
-| `chat_agent_id` | 空 | 指定 QuickWork 自定义 agent；服务端按该 agent 的 system prompt 与 tool policy 执行，用于隔离默认内置提示词和内置工具 |
-| `keep_sessions` | `false` | 关闭 `session_reuse` 时，是否保留上游会话 |
-| `session_reuse` | `true` | 以固定上游会话只送新增消息；同一会话固定使用原账号 |
-| `session_ttl` | `30m` | 会话闲置多久后从代理内存移除 |
-| `oauth.provider` | `social` | `login` 默认 provider |
-| `oauth.build_stage` | `prod` | `prod`、`beta`、`integ`、`dev` |
-| `oauth.region` | 空 | 企业 discovery 的 region 前缀；social 使用 discovery 返回的 IDC region |
-| `oauth.callback_port` | `18080` | 本机 OAuth 回调端口 |
-| `oauth.timeout` | `1h` | 等待浏览器完成登录的超时 |
+| `addr` | `127.0.0.1:8080` | Shared API / WebUI listener |
+| `database` | `data/quickwork.db` | SQLite path, relative to the configuration directory |
+| `api_keys` | `[]` | Allowed inference keys; empty disables inference authentication |
+| `models` | `smart,fast,balanced,auto` | Local model aliases returned by `/v1/models` |
+| `default_model` | `smart` | Fallback mapping for unknown model names |
+| `request_timeout` | `5m` | Timeout for an upstream request |
+| `refresh_before` | `10m` | Refresh a token when its remaining lifetime is below this threshold |
+| `max_attempts` | `3` | Maximum real upstream `Chat` attempts across all retries per request, not distinct accounts |
+| `app_version` | `1.2.4660` | Upstream handshake application version |
+| `surface` | `QUICK_WORK_DESKTOP_WINDOWS` | Upstream handshake surface type |
+| `outpost_id` / `working_session_id` | Empty | Optional upstream handshake fields |
+| `timezone` / `locale` | `UTC` / `en-US` | Timezone and language sent in `user_message`; independent of UI language |
+| `thinking_effort` | Empty | `off`, `low`, `medium`, or `high`; empty uses upstream defaults |
+| `chat_agent_id` | Empty | Custom QuickWork agent with its own system prompt and tool policy |
+| `keep_sessions` | `false` | Keep upstream sessions when session reuse is disabled |
+| `session_reuse` | `true` | Reuse a pinned upstream thread and send only new history |
+| `session_ttl` | `30m` | Idle expiry of in-memory conversation state |
+| `webui.enabled` | `true` | Enable embedded UI and management endpoints; restart required |
+| `webui.session_ttl` | `12h` | Management session lifetime, separate from conversation TTL |
+| `usage.enabled` | `true` | Synchronize official usage for enabled accounts at startup and periodically; manual sync remains available when disabled |
+| `usage.refresh_interval` | `5m` | Official usage sync interval, from `1m` to `24h` |
+| `usage.max_attempts` | `3` | Attempts for temporary official-usage failures, from `1` to `5`; separate from chat `max_attempts` |
+| `oauth.provider` | `social` | Default login provider |
+| `oauth.build_stage` | `prod` | `prod`, `beta`, `integ`, or `dev` |
+| `oauth.region` | Empty | Enterprise discovery region prefix; social uses the discovered IDC region |
+| `oauth.callback_port` | `18080` | Local OAuth callback port |
+| `oauth.timeout` | `1h` | Maximum time to complete browser login |
 
-时间字段接受 Go duration 字符串（`30s`、`5m`、`1h`）。
+Durations accept Go duration strings such as `30s`, `5m`, and `1h`. `server -addr ADDRESS` overrides only the running listener and does not write to the configuration file. Docker uses this flag by default, so its command-line listener still wins after changing `addr` in the WebUI. Configuration saved in the WebUI takes effect only after restarting the process.
 
-需要 API key 时，把 key 写进 `api_keys`：
+Configure inference keys in `api_keys`, then send an allowed key using `Authorization: Bearer ...` or `X-Api-Key`. Never commit real keys or account data.
 
-```json
-{
-  "api_keys": ["sk-local"]
-}
-```
+## Commands
 
-之后请求需带 `Authorization: Bearer sk-local`（或 `X-Api-Key: sk-local`）。
-
-## 命令
-
-| 命令 | 说明 |
+| Command | Purpose |
 |---|---|
-| `quickproxy server` | 启动反代 |
-| `quickproxy login` | 浏览器 OAuth 登录并写入 SQLite |
-| `quickproxy accounts` | 列出账号、到期时间、使用次数与最近错误 |
-| `quickproxy refresh` | 刷新全部账号的 token |
-| `quickproxy refresh -account ID` | 只刷新一个账号 |
-| `quickproxy logout -all` | 删除全部账号 |
-| `quickproxy logout -account ID` | 删除一个账号 |
+| `quickproxy server` | Start the API and enabled WebUI |
+| `quickproxy server -addr ADDRESS` | Override the listener for this run |
+| `quickproxy login` | Browser OAuth login and SQLite account storage |
+| `quickproxy accounts` | List accounts, expiry, selection counts, and recent errors |
+| `quickproxy refresh` | Refresh every account |
+| `quickproxy refresh -account ID` | Refresh one account |
+| `quickproxy logout -all` | Delete all local accounts |
+| `quickproxy logout -account ID` | Delete one local account |
 
-所有命令都支持 `-config PATH`，默认 `config.json`。
+All commands accept `-config PATH`, defaulting to `config.json`. Running without a subcommand starts the server.
 
-从旧版升级：旧的 `auth/quickauth.py` 已移除，`data/session.json` / `data/upstream.json` 不再读取。请重新执行一次 `quickproxy login`；之后所有账号都由 SQLite 管理。
-
-`login` 常用参数：
-
-| 参数 | 默认 | 说明 |
+| Login Flag | Default | Purpose |
 |---|---|---|
-| `-provider` | `config.oauth.provider` | `social`、`enterprise`、`gateway`、`social_gateway` |
-| `-stage` | `config.oauth.build_stage` | `prod`、`beta`、`integ`、`dev` |
-| `-region` | `config.oauth.region` | 企业 discovery 的 region 前缀；social 使用 discovery 返回的 IDC region |
-| `-port` | `config.oauth.callback_port` | 本机回调端口 |
-| `-timeout` | `config.oauth.timeout` | 等待浏览器完成登录的超时 |
-| `-open` | 关闭 | 同时用默认浏览器打开 URL |
-| `-manual` | 关闭 | 不监听本地回调端口，手动粘贴浏览器地址栏中的 callback URL（适合服务器） |
+| `-provider` | `config.oauth.provider` | `social`, `enterprise`, `gateway`, or `social_gateway` |
+| `-stage` | `config.oauth.build_stage` | `prod`, `beta`, `integ`, or `dev` |
+| `-region` | `config.oauth.region` | Enterprise discovery region prefix or social IDC region |
+| `-port` | `config.oauth.callback_port` | Local callback port |
+| `-timeout` | `config.oauth.timeout` | Login timeout |
+| `-open` | Off | Also open the URL in the default browser |
+| `-manual` | Off | Paste callback URLs instead of opening a callback listener |
 
-## 多账号轮询
+Upgrading from the old Python login flow: `auth/quickauth.py` was removed; `data/session.json` and `data/upstream.json` are no longer read. Sign in again using `quickproxy login`; SQLite is now the account source of truth.
 
-账号存在 SQLite 的 `accounts` 表，按 ID 轮询：
+## How It Works
 
-1. 每个请求选择下一个启用账号。
-2. 如果 token 在 `refresh_before` 内到期，先用 refresh token 自动刷新。
-3. 刷新失败或账号不可用时记录 `last_error`，跳过该账号继续轮询。
-4. 单次请求最多尝试 `max_attempts` 个账号；非流式请求和尚未向客户端发送任何数据的流式请求会自动换号重试。
-5. 一旦流式响应已经开始，就不会中途换号，避免客户端收到重复内容。
+Native Go OAuth exchanges credentials and saves accounts in SQLite. The proxy selects an enabled account, refreshes expiring credentials, then connects to the upstream WebSocket. `internal/proxy/wire.go` handles wire encoding and event-stream decoding; the upstream is not an OpenAI HTTP endpoint.
 
-`quickproxy accounts` 可查看每个账号的状态；`quickproxy refresh` 会刷新全部账号。上游 refresh token 失效时，对应账号需要重新执行 `quickproxy login`。
+### Account Rotation and Retries
 
-## 工作方式
+Accounts are selected round-robin in ID order. Failed refreshes or unusable accounts record `last_error` and are skipped. `max_attempts` is the total budget of actual upstream `Chat` attempts for a request, not a count of distinct accounts; selection failures and token refreshes do not consume a chat attempt. Retries share the original request deadline and use exponential backoff starting at 200 ms, capped at two seconds.
 
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant CLI as quickproxy login
-    participant B as 浏览器
-    participant Q as Amazon Quick
-    participant DB as SQLite
-    participant P as quickproxy server
+- **Temporary failures:** upstream throttling / HTTP 429, timeouts / HTTP 408, HTTP 5xx, selected transient network and WebSocket disconnects, and empty visible output can retry. Untried eligible accounts are preferred; once they are exhausted, a still-eligible account may be retried, so a single-account setup can recover within the same attempt budget.
+- **Authentication:** expired / invalid credentials trigger at most one explicit token refresh per account in a request, then retry that account if refresh succeeds. A repeated authentication failure excludes that account for the rest of the request.
+- **Permission or quota:** forbidden / payment-required / credit-exhausted / quota errors skip that account and try another eligible account; they do not repeatedly retry the exhausted account.
+- **Reused session missing:** invalidate local session state and retry with the full transcript in a new upstream session; an unrecoverable new-session error skips the account.
+- **No retry:** client cancellation, oversized or invalid requests, and other permanent errors stop immediately. The request deadline always wins over retries.
+- **Streaming boundary:** once the first SSE response byte is sent, no retry or account switch is attempted, avoiding duplicate output. Non-streaming and tool-buffered responses may retry only before output is committed.
 
-    U->>CLI: login
-    CLI-->>U: 打印 discovery URL
-    U->>B: 打开 URL 并登录
-    B->>CLI: 回调 code
-    CLI->>Q: 换取 token / 获取用户信息
-    CLI->>DB: 写入账号
-    U->>P: OpenAI /v1/chat/completions
-    P->>DB: 轮询选择账号
-    P->>Q: WebSocket 帧
-    Q-->>P: text_delta / message_complete
-    P-->>U: JSON 或 SSE
-```
+Every real attempt contributes to the account's call count, duration, and any official usage it reported, even if the attempt fails and another succeeds. Retries can therefore incur additional upstream usage or billing. Missing token / USD / ACP reports remain unknown or partial; successful delivery does not imply that previous attempts were free. Rotation is request-based, not quota- or token-based. An invalid refresh token requires signing in again.
 
-- 登录完全在 `quickproxy login` 内完成，不依赖官方桌面应用或 outpost。
-- `quickproxy server` 从 SQLite 读取 `jwt`、`ws_host` 和 `provider`，连接上游 WebSocket。
-- 上游不是 OpenAI HTTP API，而是 WebSocket JSON 帧；`internal/proxy/wire.go` 负责帧编码与 event-stream 解码。
+### Prompts and Tool Calls
 
-### 提示词与工具调用
+- `system` / `developer` messages and tool definitions are combined in order into a caller-instructions block at the beginning of the current user text. The upstream ignores `user_message.payload.system_prompt` and treats `custom_prompt` as lower-trust preferences, so these fields are not used for caller instructions.
+- A short neutral relay note identifies caller-defined tools and their client-side execution. The default upstream identity, system context, and built-in tools remain server-controlled.
+- Tools use `<caller_tool_interface>` definitions and `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` output. Parsing also accepts alternate tool tags, JSON wrappers, Markdown fences, `arguments` / `parameters` / `input` / `args`, namespace prefixes such as `functions.`, case variations, and unique suffix matches. Unknown tools or invalid JSON remain ordinary text.
+- Multiple calls can be returned in one turn. `parallel_tool_calls=false` limits output to one call; `tool_choice: "none"` disables bridging, and a forced function only accepts that function.
+- The proxy returns OpenAI `tool_calls` but does not execute them. Clients execute tools and send `role: tool` results back; historical calls and results are rendered into upstream text context.
+- Native upstream tool events are also collected as a fallback when they match declared client tools. Multiple event-stream messages in one WebSocket frame are all processed.
+- Tool-enabled streaming is buffered until the turn ends. Thinking-only, whitespace-only, or zero-width-only output returns an explicit error rather than an empty successful completion.
+- The default built-in agent can add roughly 60K+ tokens of upstream prompt context. To replace its prompt and tool policy, configure `chat_agent_id` to reference a custom QuickWork agent; caller instructions alone cannot remove the default identity.
 
-- `system` / `developer` 消息会按原顺序合并，与工具定义一起组成 caller 指令块，放在本轮 user 文本开头：`[System instructions from the API caller]` … `[End system instructions]`，后面才是 `[User message]` 与 transcript。
-- 这是为了适配上游实际行为：`user_message.payload.system_prompt` 会被服务端忽略（模型完全看不到），`custom_prompt` 会被当成低信任的个人偏好、可能被拒绝执行。放进 user 轮次的调用方指令则会被当作本轮任务，实测能稳定驱动工具调用与格式要求。
-- caller 指令块后面固定追加一条简短的中性 relay 说明：本轮通过 OpenAI 兼容 API 转发，调用方指令与 `<caller_tool_interface>` 定义本轮任务和工具，工具由调用方执行。刻意的「丢弃服务端提示词 / 忽略身份」措辞会触发上游的安全判断，使模型连正常指令一起拒绝，因此不使用。
-- 客户端 `tools` / `functions` / `tool_choice` 会原样写入 caller 指令块中的 `<caller_tool_interface>`，并明确说明这些工具由调用方提供、执行并回传结果，模型不需要内置对应的工具。
-- 模型使用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 发起调用。解析器同时兼容 `<tool_call>`、`<function_call>`、整段 JSON、Markdown 代码块、`tool_calls` / `tool_call` / `function_call` 包装、`arguments` / `parameters` / `input` / `args` 字段、`functions.` 等前缀、大小写差异和唯一后缀匹配。未知工具名或非法 JSON 会保留为普通文本。
-- 并行调用：允许在同一回复中连续输出多个 `<client_tool_call>`；`parallel_tool_calls=false` 时只保留第一个。
-- 代理把解析结果转成 OpenAI `tool_calls`，但**不执行工具**；客户端执行后把结果作为 `role: tool` 发回，代理再转成文本上下文。
-- 上游原生 `tool_start` / `tool_arguments` / `tool_progress` / `tool_call` / `tool_complete` / `message_complete.tool_calls` 也会被收集；`tool_progress.input_delta` 会累积为完整参数。如果文本标记没有解析出调用，代理会按客户端声明的工具名把原生事件回退成 `tool_calls`。
-- 上游一个 WebSocket 帧内可能包含多条 event-stream 消息；解码器会按顺序全部处理，不会只取第一条。
-- 上游只输出 thinking、空白或零宽字符时，代理返回明确错误并带上 `completion_tokens`，不再返回空的 `finish_reason=stop`。
-- 有客户端工具时，流式响应会缓冲到本轮结束，再一次性发送文本或 `tool_calls`；非流式不受影响。
-- `tool_choice: "none"` 关闭桥接；指定函数时只接受该函数；`parallel_tool_calls=false` 时最多返回一个工具调用。
-- 内置 agent 的 60K+ token 提示词、产品身份与内置工具仍由 QuickWork 服务端维护，无法通过 `user_message` 删除；调用方指令决定任务行为，但模型仍可能自称 AWS Quick。若需要彻底替换提示词与工具策略，在 `config.json` 设置 `chat_agent_id` 指向一个关闭内置工具、使用自定义 system prompt 的 QuickWork agent；代理会把该 ID 放进 `user_message.chat_agent_id`。
+### Session Reuse
 
-### 会话复用
+The first request sends the full transcript and records its thread/account. If later history extends the recorded history, only the suffix is sent. The conversation key uses `X-Conversation-Id`, then `X-Thread-Id`, otherwise a hash of the full system/tool prompt plus the first non-system message. Prompt/tool changes, edited history, or no new messages start a fresh upstream session. Conversations pin the original account; unavailable accounts or failed reuse fall back to a new account and full transcript. State is memory-only, expires after `session_ttl`, and is lost on restart. Reused upstream sessions are not explicitly deleted. With reuse disabled and `keep_sessions=false`, sessions are deleted after each turn.
 
-- 首轮发送完整 transcript，并记录上游 `thread_id` 与账号。
-- 后续请求若消息历史是上次已发送历史的前缀，只发送新增后缀；这样 64 KB 预算主要留给新消息。
-- 会话键优先使用 `X-Conversation-Id`，其次 `X-Thread-Id`；都没有时使用完整 system prompt（含工具定义）加第一条非 system 消息的哈希。不同工具的请求不会复用同一个上游 thread。
-- system prompt 或工具定义变化、历史被编辑、或没有新增消息时，自动回退为完整 transcript + 新上游会话。
-- 同一会话固定使用原账号；账号不可用或复用失败时，自动换账号并以完整 transcript 新建会话。
-- 会话状态只保存在内存，进程重启后首轮回退完整 transcript。闲置超过 `session_ttl` 会从代理移除。
-- 复用启用时不会发送 `session_delete`，上游会话会保留到服务端自身过期。
+### Request Logs
 
-### 请求日志
+Chat logs report request start, account attempts, upstream event counts, and final outcome: model, attempts, elapsed time, token usage, finish reason, tool-call count, and errors. Status is `ok`, `empty`, or `failed`. Logs do not intentionally include tokens, client secrets, or request bodies, but can include account email addresses and upstream errors; protect access to them.
 
-每个聊天请求输出请求开始、每次账号尝试、最终结果，以及一行上游事件统计。最终结果包含状态、账号、上游模型、尝试次数、耗时、token 用量、`finish_reason`、工具调用数和错误信息。
+## Security and Privacy
 
-```
-chat chatcmpl-... start model=smart upstream_model=smart stream=false messages=2 prompt_chars=205 system_chars=40587 thread=""
-chat chatcmpl-... attempt=1/3 account=1:social:user@example.com
-upstream events thread=... counts=map[text_delta:2 text_complete:1 turn_usage:1] text_chars=89 tool_calls=0
-chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart attempts=1 elapsed=1.234s tokens{prompt=1200 completion=56 total=1256 cache_read=1024 cache_write=0} finish=stop tool_calls=0
-```
+- The SQLite database contains access/refresh tokens, client secrets, and user information. Runtime data is gitignored; do not commit or share `data/` or persistent volumes.
+- `config.json` has no keys by default. If you configure inference keys, treat the file as sensitive.
+- Upstream passwords are entered only on Amazon's browser pages, not stored by this project. Use a separate WebUI administrator password rather than reusing an upstream password.
+- Management configuration/account responses do not expose inference keys, account tokens, refresh tokens, or client secrets. Treat temporary OAuth callback URLs as sensitive.
+- Oversized user text can be uploaded into your Quick tenant as an attachment and is subject to your organization's DLP policy.
+- The native server and Compose host publishing default to loopback. For remote use, add TLS and access controls, configure inference authentication, and restrict management access.
+- `quickproxy logout -all` deletes local accounts and their refresh state; it does not revoke upstream grants.
 
-`status` 为 `ok`、`empty` 或 `failed`；`attempt` 为 `id/最大尝试次数`。失败时附加 `error=...`。日志不会输出 token、client secret 或请求正文。
+## Limitations
 
-## 安全与隐私
+- Chat completions only. Sampling fields such as `temperature`, `max_tokens`, `stop`, and `response_format` are not forwarded; `n > 1` returns HTTP 400.
+- Each upstream `user_message` has a 64 KB JSON-byte limit. Reuse reduces history size. Oversized new user text first attempts attachment upload, DLP polling, and delivery through `files/upload/<thread>`. Only DLP `ALLOW` is accepted; `WARN` is unavailable. Caller instructions and tool definitions stay in WebSocket text rather than attachments.
+- Missing tenant URLs, gateway transport, upload failures, or rejected DLP checks fall back to truncating the middle while preserving the beginning and end within the byte budget. Only a minimal frame that still cannot fit produces `400 request_too_large`.
+- WebSocket fragmentation does not bypass the reassembled message limit. Multiple user messages are multiple turns; `mid_turn` steering and `message_split` output events cannot reassemble a single input turn.
+- Text-based tool bridging depends on model behavior and can fail to follow the protocol. Tool-enabled streaming is buffered, and tools remain client-executed.
+- The default upstream prompt, product identity, and built-in tools cannot be removed by per-turn caller text. Use a custom `chat_agent_id` for isolation.
+- Models map to upstream modes `smart`, `fast`, `balanced`, and `auto`. `/v1/models` lists local aliases, not a discovered upstream model catalog.
+- Social / enterprise paths have previously been exercised with real accounts; `gateway` / `social_gateway` CBOR transport remains experimental. Caller-instruction behavior on enterprise / gateway still needs validation.
+- Upstream access tokens usually expire after about an hour. Refresh uses `refresh_before`; omitted replacement ID tokens preserve the previous value, and transient user-info failures do not discard successfully refreshed tokens.
+- Configuration edits are restart-only. Management sessions and conversation reuse state are not persistent.
+- Recorded account statistics do not reconstruct earlier history. Token / USD / ACP credit reports may be absent or partial, and official monthly-minute quota support varies by provider and plan; the quota transport is source-confirmed but not live-validated in this change.
+- Upstream interfaces can change with official client updates. Re-login first when authentication or chat stops working.
+- No association with Amazon / AWS and no service guarantees.
 
-- `data/quickwork.db` 包含 access token、refresh token、client secret 和用户信息，已被 `.gitignore` 排除。
-- 当单个 `user_message` 超过 64 KB 且账号有 `tenant_url` 时，代理会把该轮用户内容作为临时文本附件上传到 Quick 的附件服务并等待 DLP 扫描；这是绕过单帧上限的方式，内容仍位于你的 Quick 租户内，但受组织 DLP 策略约束。
-- `config.json` 默认不含密钥；如果写入 `api_keys`，不要提交真实 key。
-- 登录密码只在 Amazon 的浏览器页面中输入，本项目不会保存密码。
-- 反代默认只监听 `127.0.0.1`。不要把端口直接暴露到公网；如确需远程访问，请自行加 TLS 与访问控制。
-- `quickproxy logout -all` 会删除本地账号与 refresh 状态。
-- 不要提交或分享 `data/` 目录。
+## Troubleshooting
 
-## 限制
-
-- 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
-- 上游 `user_message` 帧上限 64 KB。会话复用开启时通常只送新增消息；若单个 delta 仍超限，代理会先把该轮用户内容上传为上游附件（`POST /integration/quick-work/upload-attachment`、轮询 `attachment-dlp-status`、再以 `qbs-event` 投递到 `files/upload/<thread>`），WS 只送短引用和 `attachments` 元数据；附件必须在 DLP 返回 `ALLOW` 后才能使用，`WARN` 视为不可用。附件只放用户内容，调用方指令与工具定义留在 WS 文本中，避免模型把附件里的指令当成注入。附件路径失败、账号没有 `tenant_url`、gateway transport 或被 DLP 拒绝时，代理回退到裁剪：按实际 JSON 字节保留开头与结尾、裁剪中间内容，并记录 `user_message trimmed ...`；只有连最小帧都无法放入时才返回 `400 request_too_large`。
-- WebSocket 分片只影响传输层，上游重組後仍按單一 `user_message` 檢查 64 KB。多個 `user_message` 會被視為多輪；`mid_turn` 是 steering，`message_split` 是服務端輸出事件，不能用來拼接同一輪輸入。
-- 工具桥接使用文本协议，模型偶尔可能不遵守；有工具时流式响应会缓冲到本轮结束。代理只解析并返回 `tool_calls`，不执行工具。
-- 默认内置 agent 仍会在服务端附加约 60K token 的提示词和内置工具。调用方指令通过 user 轮次影响任务行为，但不能删除服务端上下文或改掉产品身份；需要彻底隔离时使用 `chat_agent_id` 指向自定义 agent。
-- 上游会忽略 `user_message.payload.system_prompt`，并把 `custom_prompt` 视为低信任偏好；代理因此不再使用这两个字段。caller 指令跟随 user 文本发送，已在 social 路径用真实账号验证；enterprise / gateway 仍待验证。
-- `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
-- 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
-- social / enterprise 路径已做真实账号验证；`gateway` / `social_gateway` 的 CBOR 路径仍属实验性。
-- 上游 access token 通常约 1 小时到期，反代会按 `refresh_before` 自动刷新；也可手动执行 `quickproxy refresh`。refresh 响应未返回新的 ID token 时会保留旧值，用户信息接口短暂失败不会丢弃已刷新的 token。
-- 多账号轮询按请求选择账号，不按 token 用量或配额调度。
-- 上游接口可能随官方客户端更新而变化；若登录或聊天失败，先重新执行 `quickproxy login`。
-- 本项目与 Amazon / AWS 无关联，不提供任何服务保证。
-
-## 故障排查
-
-| 现象 | 处理 |
+| Symptom | Action |
 |---|---|
-| `cannot listen on 127.0.0.1:18080` | 关闭占用 18080 的其他进程，或用 `-port` / `oauth.callback_port` 换端口 |
-| 浏览器登录后一直等待 | 确认浏览器与命令在同一台机器，且回调端口可达；远程服务器请用 `login -manual` |
-| 服务器上 `localhost:18080` 回调打不开 | 这是预期现象；用 `login -manual`，复制浏览器地址栏的完整 URL 回填 |
-| `upstream_session_unavailable` / `no accounts configured` | 运行 `quickproxy login` |
-| `401 invalid_api_key` | 检查 `config.json` 的 `api_keys` 与请求头中的 key 是否一致 |
-| 登录页面报错 | 查看终端输出的错误；确认 `-provider` 与账号类型匹配 |
-| 多账号请求总是失败 | 运行 `quickproxy accounts` 查看 `last_error`；对失效账号重新 `login` 或 `logout -account ID` |
-| token 过期 | 通常自动刷新；也可运行 `quickproxy refresh` |
+| `cannot listen on 127.0.0.1:18080` | Free the callback port or change `-port` / `oauth.callback_port` |
+| CLI keeps waiting after browser login | Use the same machine with a reachable callback, or use `login -manual` / WebUI |
+| Remote `localhost:18080` callback does not load | Expected in manual mode; copy the complete address-bar URL |
+| `upstream_session_unavailable` / `no accounts configured` | Add an account in the WebUI or run `quickproxy login` |
+| `401 invalid_api_key` | Check inference keys against the request header; administrator credentials are separate |
+| WebUI says no administrator password is configured | Set `QUICKPROXY_ADMIN_PASSWORD` to 12–1024 bytes in the server environment and restart |
+| Playground cannot authenticate | Enter a configured inference API key in Playground, not the administrator password |
+| Saved settings do not change behavior | Restart the server; `server -addr` still overrides the listener |
+| Account attempts keep failing | Inspect `quickproxy accounts`; refresh or sign in again for the affected account |
+| Tokens expire | Automatic refresh normally handles this; use `quickproxy refresh` if needed |
+| Container account data appears missing | Use the same volume and `/app/data/config.json`; default DB is `/app/data/data/quickwork.db` |
 
-## 目录
+## Layout
 
-```
+```text
 quickwork-openai/
-  config.json              服务端配置（首次运行自动生成）
-  cmd/quickproxy/          CLI：server / login / accounts / refresh / logout
-  internal/config/         config.json 加载与默认值
-  internal/oauth/          原生 OAuth、PKCE、token refresh、user info
-  internal/store/          SQLite 账号存储
-  internal/accounts/       多账号轮询与自动刷新
-  internal/proxy/          WebSocket codec、OpenAI handler
-  data/quickwork.db        运行期账号库（gitignored）
+  cmd/quickproxy/           CLI commands and server startup
+  internal/admin/          Embedded WebUI, administrator sessions, management API
+  internal/admin/static/   HTML / CSS / JS and English / Chinese UI
+  internal/config/         Configuration loading, defaults, persistence
+  internal/oauth/          Native OAuth / PKCE, token refresh, user information
+  internal/oauth/browser.go Staged callback flow shared with the WebUI
+  internal/store/          SQLite accounts
+  internal/accounts/       Account rotation and automatic refresh
+  internal/proxy/          OpenAI handlers, WebSocket protocol, sessions, tools
+  config.json              Generated server configuration
+  data/quickwork.db         Runtime account database, gitignored
+  Dockerfile               Multi-stage image, non-root runtime
+  compose.yaml             Persistent volume and loopback publishing
+  README.md                English documentation
+  README.zh-CN.md           Simplified Chinese documentation
 ```
 
 ## License
 
-本项目采用 [GNU General Public License v3.0](LICENSE) 授权。
+Licensed under the [GNU General Public License v3.0](LICENSE).
 
 ## Acknowledgements
 
 Thanks to the [LINUX DO](https://linux.do) community for its support.
-
-## Fork notes (devkeviny/aws-quickwork-2api, private)
-
-Based on upstream v0.4.2. Differences from upstream:
-
-- **Real model names**: `/v1/models` advertises `claude-opus-5-5` (smart)
-  and `claude-haiku-5-5` (fast) so routers and audits classify by the true
-  model (`mapModel` in `internal/proxy/server.go` maps them back).
-  `balanced` and `auto` are unchanged.
-- **Dockerfile** (multi-stage Go build) for container deploys.
-- **config.json** listens on `0.0.0.0:8080` for containers.

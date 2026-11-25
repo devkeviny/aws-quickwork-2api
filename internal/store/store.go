@@ -46,14 +46,16 @@ type Account struct {
 
 	UserInfo string `json:"-"`
 
-	ExpiresAt  int64  `json:"expires_at"`
-	ObtainedAt int64  `json:"obtained_at"`
-	CreatedAt  int64  `json:"created_at"`
-	UpdatedAt  int64  `json:"updated_at"`
-	LastUsedAt int64  `json:"last_used_at"`
-	UseCount   int64  `json:"use_count"`
-	Disabled   bool   `json:"disabled"`
-	LastError  string `json:"last_error"`
+	ExpiresAt  int64         `json:"expires_at"`
+	ObtainedAt int64         `json:"obtained_at"`
+	CreatedAt  int64         `json:"created_at"`
+	UpdatedAt  int64         `json:"updated_at"`
+	LastUsedAt int64         `json:"last_used_at"`
+	UseCount   int64         `json:"use_count"`
+	Disabled   bool          `json:"disabled"`
+	LastError  string        `json:"last_error"`
+	Usage      CallStats     `json:"usage"`
+	Quota      QuotaSnapshot `json:"quota"`
 }
 
 // JWT returns the token used for the upstream WebSocket handshake.
@@ -151,6 +153,35 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email_tenant ON accounts(email, tenant_url);
 CREATE INDEX IF NOT EXISTS idx_accounts_enabled ON accounts(disabled, id);
+CREATE TABLE IF NOT EXISTS account_metrics (
+	account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+	call_count INTEGER NOT NULL DEFAULT 0,
+	success_count INTEGER NOT NULL DEFAULT 0,
+	failure_count INTEGER NOT NULL DEFAULT 0,
+	total_duration_ms INTEGER NOT NULL DEFAULT 0,
+	prompt_tokens INTEGER NOT NULL DEFAULT 0,
+	completion_tokens INTEGER NOT NULL DEFAULT 0,
+	total_tokens INTEGER NOT NULL DEFAULT 0,
+	cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+	cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+	cost_usd REAL NOT NULL DEFAULT 0,
+	cost_reported_calls INTEGER NOT NULL DEFAULT 0,
+	stats_since INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS account_quota (
+	account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+	snapshot TEXT NOT NULL DEFAULT '{}',
+	synced_at INTEGER NOT NULL DEFAULT 0,
+	last_attempt_at INTEGER NOT NULL DEFAULT 0,
+	error_code TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS account_credits (
+	account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	unit TEXT NOT NULL,
+	amount REAL NOT NULL DEFAULT 0,
+	reported_calls INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (account_id, unit)
+);
 `
 	_, err := s.db.Exec(schema)
 	return err
@@ -161,7 +192,17 @@ const columns = `id, email, display_name, provider, build_stage, region,
 	actor_arn, aws_account_id, account_name, client_id, client_secret,
 	issuer_url, idc_region, auth_endpoint, token_endpoint, redirect_uri,
 	user_info, expires_at, obtained_at, created_at, updated_at,
-	last_used_at, use_count, disabled, last_error`
+	last_used_at, use_count, disabled, last_error,
+	COALESCE((SELECT json_array(call_count, success_count, failure_count, total_duration_ms,
+		prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
+		CASE WHEN cost_reported_calls > 0 THEN cost_usd ELSE NULL END, cost_reported_calls, stats_since)
+		FROM account_metrics WHERE account_id=accounts.id), '[]'),
+	COALESCE((SELECT snapshot FROM account_quota WHERE account_id=accounts.id), '{}'),
+	COALESCE((SELECT synced_at FROM account_quota WHERE account_id=accounts.id), 0),
+	COALESCE((SELECT last_attempt_at FROM account_quota WHERE account_id=accounts.id), 0),
+	COALESCE((SELECT error_code FROM account_quota WHERE account_id=accounts.id), ''),
+	COALESCE((SELECT json_group_array(json_object('unit', unit, 'amount', amount, 'reported_calls', reported_calls))
+		FROM account_credits WHERE account_id=accounts.id), '[]')`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -170,6 +211,8 @@ type scanner interface {
 func scanAccount(row scanner) (*Account, error) {
 	var a Account
 	var disabled int
+	var metricsJSON, quotaJSON, quotaError, creditsJSON string
+	var syncedAt, attemptedAt int64
 	err := row.Scan(
 		&a.ID, &a.Email, &a.DisplayName, &a.Provider, &a.BuildStage, &a.Region,
 		&a.TenantURL, &a.WSHost, &a.WSPath, &a.AccessToken, &a.RefreshToken, &a.IDToken,
@@ -177,11 +220,21 @@ func scanAccount(row scanner) (*Account, error) {
 		&a.IssuerURL, &a.IDCRegion, &a.AuthEndpoint, &a.TokenEndpoint, &a.RedirectURI,
 		&a.UserInfo, &a.ExpiresAt, &a.ObtainedAt, &a.CreatedAt, &a.UpdatedAt,
 		&a.LastUsedAt, &a.UseCount, &disabled, &a.LastError,
+		&metricsJSON, &quotaJSON, &syncedAt, &attemptedAt, &quotaError, &creditsJSON,
 	)
 	if err != nil {
 		return nil, err
 	}
 	a.Disabled = disabled != 0
+	if err := a.Usage.decode(metricsJSON); err != nil {
+		return nil, err
+	}
+	if err := a.Quota.decode(quotaJSON, syncedAt, attemptedAt, quotaError); err != nil {
+		return nil, err
+	}
+	if err := a.Usage.decodeCredits(creditsJSON); err != nil {
+		return nil, err
+	}
 	return &a, nil
 }
 

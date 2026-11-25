@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"quickwork-openai/internal/accounts"
+	"quickwork-openai/internal/admin"
 	"quickwork-openai/internal/config"
 	"quickwork-openai/internal/oauth"
 	"quickwork-openai/internal/proxy"
@@ -57,7 +58,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `quickwork-openai - Amazon Quick to OpenAI-compatible API
 
 Usage:
-  quickproxy server   [-config config.json]
+  quickproxy server   [-config config.json] [-addr 127.0.0.1:8080]
   quickproxy login    [-config config.json] [-provider social|enterprise|gateway|social_gateway]
                       [-stage prod|beta|integ|dev] [-region REGION] [-port 18080]
                       [-timeout 1h] [-open] [-manual]
@@ -88,6 +89,7 @@ func openStore(cfg *config.Config) (*store.Store, error) {
 func runServer(args []string) int {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	configPath := fs.String("config", "config.json", "path to config.json")
+	addr := fs.String("addr", "", "override the HTTP listen address without changing config.json")
 	_ = fs.Parse(args)
 
 	cfg, err := loadConfig(*configPath)
@@ -105,15 +107,33 @@ func runServer(args []string) int {
 	mgr := accounts.New(st, cfg)
 	count, _ := mgr.EnabledCount(context.Background())
 	handler := proxy.NewServer(cfg, mgr).Handler()
+	if cfg.WebUI.Enabled {
+		panel, err := admin.NewServer(cfg, st, mgr, *addr != "")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "webui:", err)
+			return 1
+		}
+		defer panel.Close()
+		handler = panel.Handler(handler)
+		log.Printf("WebUI enabled at / (management authentication is independent of proxy API keys)")
+		if !panel.Configured() {
+			log.Printf("WebUI login is disabled until the admin password environment variable is configured")
+		}
+	}
+	listenAddr := cfg.Addr
+	if *addr != "" {
+		listenAddr = *addr
+	}
 	server := &http.Server{
-		Addr:              cfg.Addr,
+		Addr:              listenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
 	log.Printf("quickwork-openai listening on %s (config=%s db=%s accounts=%d auth=%v)",
-		cfg.Addr, cfg.Path, cfg.Database, count, len(cfg.APIKeys) > 0)
+		listenAddr, cfg.Path, cfg.Database, count, len(cfg.APIKeys) > 0)
 	log.Printf("models=%s default_model=%s request_timeout=%s refresh_before=%s max_attempts=%d keep_sessions=%v session_reuse=%v session_ttl=%s",
 		strings.Join(cfg.Models, ","), cfg.DefaultModel, cfg.RequestTimeout.Duration(),
 		cfg.RefreshBefore.Duration(), cfg.MaxAttempts, cfg.KeepSessions, cfg.SessionReuse, cfg.SessionTTL.Duration())
@@ -123,6 +143,8 @@ func runServer(args []string) int {
 
 	stop, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	stopUsageSync := mgr.StartUsageSync(stop)
+	defer stopUsageSync()
 	listenErr := make(chan error, 1)
 	go func() {
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -236,7 +258,7 @@ func listAccounts(args []string) int {
 		return 0
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tEMAIL\tPROVIDER\tSTAGE\tREGION\tEXPIRES\tUSES\tSTATUS")
+	fmt.Fprintln(tw, "ID\tEMAIL\tPROVIDER\tSTAGE\tREGION\tEXPIRES\tCALLS\tOK/FAILED\tELAPSED\tTOKENS\tUSD\tCREDITS\tSELECTS\tSTATUS")
 	now := time.Now()
 	for i := range list {
 		a := &list[i]
@@ -249,9 +271,23 @@ func listAccounts(args []string) int {
 		if a.LastError != "" {
 			status += " (" + a.LastError + ")"
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+		cost := "unknown"
+		if a.Usage.CostUSD != nil {
+			cost = fmt.Sprintf("%.6g (%d/%d)", *a.Usage.CostUSD, a.Usage.CostReportedCalls, a.Usage.CallCount)
+		}
+		credits := make([]string, 0, len(a.Usage.Credits))
+		for _, credit := range a.Usage.Credits {
+			credits = append(credits, fmt.Sprintf("%.6g %s (%d/%d)", credit.Amount, credit.Unit, credit.ReportedCalls, a.Usage.CallCount))
+		}
+		creditSummary := strings.Join(credits, "; ")
+		if creditSummary == "" {
+			creditSummary = "unknown"
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d/%d\t%s\t%d\t%s\t%s\t%d\t%s\n",
 			a.ID, displayAccount(a), a.Provider, a.BuildStage, a.Region,
-			formatEpoch(a.ExpiresAt), a.UseCount, status)
+			formatEpoch(a.ExpiresAt), a.Usage.CallCount, a.Usage.SuccessCount, a.Usage.FailureCount,
+			(time.Duration(a.Usage.TotalDurationMS) * time.Millisecond).Round(time.Millisecond),
+			a.Usage.TotalTokens, cost, creditSummary, a.UseCount, status)
 	}
 	_ = tw.Flush()
 	return 0

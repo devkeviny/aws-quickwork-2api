@@ -49,6 +49,17 @@ type OAuth struct {
 	Timeout      Duration `json:"timeout"`
 }
 
+type WebUI struct {
+	Enabled    bool     `json:"enabled"`
+	SessionTTL Duration `json:"session_ttl"`
+}
+
+type Usage struct {
+	Enabled         bool     `json:"enabled"`
+	RefreshInterval Duration `json:"refresh_interval"`
+	MaxAttempts     int      `json:"max_attempts"`
+}
+
 // Config is the server configuration stored in config.json.
 type Config struct {
 	Addr             string   `json:"addr"`
@@ -71,9 +82,14 @@ type Config struct {
 	SessionReuse     bool     `json:"session_reuse"`
 	SessionTTL       Duration `json:"session_ttl"`
 	OAuth            OAuth    `json:"oauth"`
+	WebUI            WebUI    `json:"webui"`
+	Usage            Usage    `json:"usage"`
 
 	// Path is the absolute config file path; not serialized.
 	Path string `json:"-"`
+
+	originalDatabase string
+	resolvedDatabase string
 }
 
 // Default returns the built-in configuration.
@@ -100,6 +116,20 @@ func Default() Config {
 			BuildStage:   "prod",
 			CallbackPort: 18080,
 			Timeout:      Duration(time.Hour),
+		},
+		WebUI: WebUI{
+			// Fork divergence (upstream defaults this to true): the
+			// management panel stays off unless config.json opts in.
+			// Load() unmarshals the file over Default(), so a true
+			// default would enable the panel on every existing
+			// deployment whose config has no "webui" key.
+			Enabled:    false,
+			SessionTTL: Duration(12 * time.Hour),
+		},
+		Usage: Usage{
+			Enabled:         true,
+			RefreshInterval: Duration(5 * time.Minute),
+			MaxAttempts:     3,
 		},
 	}
 }
@@ -131,13 +161,23 @@ func Load(configPath string) (*Config, error) {
 	}
 	cfg.Path = abs
 	applyDefaults(&cfg)
-	if err := cfg.validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", abs, err)
 	}
+	cfg.originalDatabase = cfg.Database
 	if !filepath.IsAbs(cfg.Database) {
 		cfg.Database = filepath.Join(filepath.Dir(abs), cfg.Database)
 	}
+	cfg.resolvedDatabase = cfg.Database
 	return &cfg, nil
+}
+
+func (c *Config) FileValues() Config {
+	value := *c
+	if c.originalDatabase != "" && c.Database == c.resolvedDatabase {
+		value.Database = c.originalDatabase
+	}
+	return value
 }
 
 func write(path string, cfg *Config) error {
@@ -149,7 +189,34 @@ func write(path string, cfg *Config) error {
 		return err
 	}
 	body = append(body, '\n')
-	return os.WriteFile(path, body, 0o600)
+	file, err := os.CreateTemp(filepath.Dir(path), ".quickproxy-config-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err := file.Write(body); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
+}
+
+func (c *Config) Save() error {
+	if c.Path == "" {
+		return errors.New("config path is empty")
+	}
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	value := c.FileValues()
+	return write(c.Path, &value)
 }
 
 func applyDefaults(c *Config) {
@@ -202,14 +269,32 @@ func applyDefaults(c *Config) {
 	if c.OAuth.Timeout <= 0 {
 		c.OAuth.Timeout = d.OAuth.Timeout
 	}
+	if c.WebUI.SessionTTL <= 0 {
+		c.WebUI.SessionTTL = d.WebUI.SessionTTL
+	}
+	if c.Usage.RefreshInterval <= 0 {
+		c.Usage.RefreshInterval = d.Usage.RefreshInterval
+	}
+	if c.Usage.MaxAttempts <= 0 {
+		c.Usage.MaxAttempts = d.Usage.MaxAttempts
+	}
 }
 
-func (c *Config) validate() error {
+func (c *Config) Validate() error {
 	if c.RequestTimeout <= 0 {
 		return fmt.Errorf("request_timeout must be positive")
 	}
 	if c.OAuth.CallbackPort < 0 || c.OAuth.CallbackPort > 65535 {
 		return fmt.Errorf("oauth.callback_port must be 0-65535")
+	}
+	if c.WebUI.SessionTTL < Duration(time.Minute) || c.WebUI.SessionTTL > Duration(7*24*time.Hour) {
+		return fmt.Errorf("webui.session_ttl must be between 1m and 168h")
+	}
+	if c.Usage.RefreshInterval < Duration(time.Minute) || c.Usage.RefreshInterval > Duration(24*time.Hour) {
+		return fmt.Errorf("usage.refresh_interval must be between 1m and 24h")
+	}
+	if c.Usage.MaxAttempts < 1 || c.Usage.MaxAttempts > 5 {
+		return fmt.Errorf("usage.max_attempts must be between 1 and 5")
 	}
 	switch strings.ToLower(c.OAuth.Provider) {
 	case "social", "enterprise", "gateway", "social_gateway":

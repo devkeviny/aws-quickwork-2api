@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,8 @@ import (
 // ErrNoAccounts means the database has no enabled account.
 var ErrNoAccounts = errors.New("no accounts configured; run `quickproxy login`")
 
+var ErrNoAvailableAccounts = errors.New("no available accounts remain for this request")
+
 // Manager rotates over enabled accounts and refreshes tokens on demand.
 type Manager struct {
 	store *store.Store
@@ -27,10 +30,20 @@ type Manager struct {
 
 	mu    sync.Mutex
 	locks map[int64]*sync.Mutex
+
+	usageMu      sync.Mutex
+	usageRunning bool
+	usageNextRun int64
+	usageLocks   map[int64]*sync.Mutex
 }
 
 func New(st *store.Store, cfg *config.Config) *Manager {
-	return &Manager{store: st, cfg: cfg, locks: make(map[int64]*sync.Mutex)}
+	return &Manager{
+		store:      st,
+		cfg:        cfg,
+		locks:      make(map[int64]*sync.Mutex),
+		usageLocks: make(map[int64]*sync.Mutex),
+	}
 }
 
 func (m *Manager) lockFor(id int64) *sync.Mutex {
@@ -44,10 +57,38 @@ func (m *Manager) lockFor(id int64) *sync.Mutex {
 	return l
 }
 
+func lockAccount(ctx context.Context, lock *sync.Mutex) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lock.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if lock.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
 // Next returns the next usable account in round-robin order. Expiring tokens
 // are refreshed before the account is returned. Accounts whose refresh fails
 // are skipped so one broken login does not take the proxy down.
 func (m *Manager) Next(ctx context.Context) (*store.Account, error) {
+	return m.NextExcluding(ctx, nil)
+}
+
+func (m *Manager) NextExcluding(ctx context.Context, unavailable map[int64]bool) (*store.Account, error) {
 	list, err := m.store.Enabled(ctx)
 	if err != nil {
 		return nil, err
@@ -62,9 +103,18 @@ func (m *Manager) Next(ctx context.Context) (*store.Account, error) {
 			return nil, err
 		}
 		a := &list[(start+i)%len(list)]
+		if unavailable[a.ID] {
+			continue
+		}
 		usable, err := m.ensureFresh(ctx, a)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			_ = m.store.SetError(ctx, a.ID, err.Error())
+			if unavailable != nil {
+				unavailable[a.ID] = true
+			}
 			errs = append(errs, fmt.Sprintf("account %d (%s): %v", a.ID, a.Email, err))
 			continue
 		}
@@ -73,7 +123,10 @@ func (m *Manager) Next(ctx context.Context) (*store.Account, error) {
 		}
 		return usable, nil
 	}
-	return nil, fmt.Errorf("no usable account: %s", strings.Join(errs, "; "))
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNoAvailableAccounts, strings.Join(errs, "; "))
+	}
+	return nil, ErrNoAvailableAccounts
 }
 
 // NextPinned returns one specific account, refreshing it when needed. It is
@@ -105,7 +158,9 @@ func (m *Manager) ensureFresh(ctx context.Context, a *store.Account) (*store.Acc
 		return a, nil
 	}
 	lock := m.lockFor(a.ID)
-	lock.Lock()
+	if err := lockAccount(ctx, lock); err != nil {
+		return nil, err
+	}
 	defer lock.Unlock()
 
 	// Another request may have refreshed it while we waited.
@@ -141,7 +196,9 @@ func (m *Manager) RefreshOne(ctx context.Context, id int64) (*store.Account, err
 		return nil, err
 	}
 	lock := m.lockFor(id)
-	lock.Lock()
+	if err := lockAccount(ctx, lock); err != nil {
+		return nil, err
+	}
 	defer lock.Unlock()
 	if a, err = m.store.Get(ctx, id); err != nil {
 		return nil, err
@@ -192,6 +249,36 @@ func (m *Manager) ReportFailure(ctx context.Context, id int64, err error) {
 		return
 	}
 	_ = m.store.SetError(ctx, id, err.Error())
+}
+
+type CallUsage struct {
+	Duration         time.Duration
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CacheReadTokens  int
+	CacheWriteTokens int
+	CostUSD          *float64
+	Credits          []store.CreditUsage
+	Success          bool
+}
+
+func (m *Manager) RecordCall(ctx context.Context, id int64, usage CallUsage) {
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := m.store.RecordCall(recordCtx, id, store.CallUsage{
+		Duration:         usage.Duration,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+		CacheReadTokens:  usage.CacheReadTokens,
+		CacheWriteTokens: usage.CacheWriteTokens,
+		CostUSD:          usage.CostUSD,
+		Credits:          usage.Credits,
+		Success:          usage.Success,
+	}); err != nil {
+		log.Printf("account %d call usage could not be recorded", id)
+	}
 }
 
 // EnabledCount returns the number of accounts in rotation.

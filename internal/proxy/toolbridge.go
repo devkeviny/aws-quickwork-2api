@@ -253,9 +253,143 @@ func looksLikeJSON(s string) bool {
 	return t != "" && (t[0] == '{' || t[0] == '[')
 }
 
-// parseToolEnvelopes accepts a single object, an array, an OpenAI tool_calls
-// wrapper, or a legacy function_call wrapper.
+// escapeRawControls escapes raw control characters inside JSON string
+// literals. Port of magpie's escapeRawControls (httpdone/magpie-aws-quick,
+// lib/tools.mjs): the model sometimes writes literal newlines/tabs inside
+// long string values (file contents, heredocs) and strict JSON rejects
+// them. Characters outside strings pass through unchanged.
+var ctrlEscapes = map[byte]string{
+	'\n': "\\n", '\r': "\\r", '\t': "\\t", '\b': "\\b", '\f': "\\f",
+}
+
+func escapeRawControls(s string) string {
+	var out strings.Builder
+	out.Grow(len(s))
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inStr {
+			if esc {
+				esc = false
+			} else if ch == '\\' {
+				esc = true
+			} else if ch == '"' {
+				inStr = false
+			} else if ch < ' ' {
+				if e, ok := ctrlEscapes[ch]; ok {
+					out.WriteString(e)
+				} else {
+					fmt.Fprintf(&out, "\\u%04x", ch)
+				}
+				continue
+			}
+		} else if ch == '"' {
+			inStr = true
+		}
+		out.WriteByte(ch)
+	}
+	return out.String()
+}
+
+// outermostJSONSpan returns the substring from the first '{' to the last
+// '}' (inclusive), or "" when there is none. It strips stray markup the
+// model wraps around the JSON (a ```json fence, an Anthropic-style
+// </invoke> before the close tag). Port of magpie's parseCall span.
+func outermostJSONSpan(s string) string {
+	a := strings.IndexByte(s, '{')
+	b := strings.LastIndexByte(s, '}')
+	if a < 0 || b <= a {
+		return ""
+	}
+	return s[a : b+1]
+}
+
+// completeBraces appends the closing braces a JSON object is missing at
+// the end. Our extension beyond magpie: the blocks that leaked on 24/nov
+// were each missing one final '}'. It only completes when the text is
+// otherwise well-formed (strings closed, at most 3 braces missing), so a
+// block truncated mid-value still fails to parse and is dropped, never
+// executed with partial arguments.
+func completeBraces(s string) string {
+	depth := 0
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inStr {
+			if esc {
+				esc = false
+			} else if ch == '\\' {
+				esc = true
+			} else if ch == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth < 0 {
+				return ""
+			}
+		}
+	}
+	if inStr || depth <= 0 || depth > 3 {
+		return ""
+	}
+	return s + strings.Repeat("}", depth)
+}
+
+// recoveryCandidates lists the forms to try for a tool-call JSON text, in
+// order: as-is, outermost {…} span, each with raw control characters
+// escaped (magpie's parseCall), then the brace-completed span and payload
+// (our extension). Duplicates and empties are dropped.
+func recoveryCandidates(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	span := outermostJSONSpan(s)
+	seen := make(map[string]bool)
+	var out []string
+	add := func(c string) {
+		if c != "" && !seen[c] {
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	add(s)
+	add(span)
+	add(escapeRawControls(s))
+	add(escapeRawControls(span))
+	add(completeBraces(span))
+	add(escapeRawControls(completeBraces(span)))
+	add(completeBraces(s))
+	add(escapeRawControls(completeBraces(s)))
+	return out
+}
+
+// parseToolEnvelopes recovers malformed tool-call JSON the way magpie's
+// parseCall does: the first candidate that parses wins. A block no
+// candidate parses is still dropped as machine protocol, never leaked.
 func parseToolEnvelopes(payload string) []toolCallEnvelope {
+	for _, cand := range recoveryCandidates(payload) {
+		if env := parseToolEnvelopesStrict(cand); len(env) > 0 {
+			return env
+		}
+	}
+	return nil
+}
+
+// parseToolEnvelopesStrict accepts a single object, an array, an OpenAI
+// tool_calls wrapper, or a legacy function_call wrapper. Strict JSON only;
+// recovery lives in parseToolEnvelopes.
+func parseToolEnvelopesStrict(payload string) []toolCallEnvelope {
 	payload = strings.TrimSpace(payload)
 	if payload == "" {
 		return nil
@@ -324,7 +458,21 @@ func normalizeArguments(raw json.RawMessage) string {
 		return "{}"
 	}
 	if !json.Valid([]byte(text)) {
-		return "{}"
+		// Recovery (magpie port): a literal newline/tab inside a string
+		// value or stray markup around the object makes strict JSON
+		// fail; try the escaped and outermost-span forms before
+		// giving up on the arguments.
+		recovered := ""
+		for _, cand := range recoveryCandidates(text) {
+			if json.Valid([]byte(cand)) {
+				recovered = cand
+				break
+			}
+		}
+		if recovered == "" {
+			return "{}"
+		}
+		text = recovered
 	}
 	var compacted any
 	if json.Unmarshal([]byte(text), &compacted) != nil {

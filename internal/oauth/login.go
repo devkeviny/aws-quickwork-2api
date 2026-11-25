@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"quickwork-openai/internal/outbound"
 	"quickwork-openai/internal/store"
 )
 
@@ -29,6 +30,8 @@ type LoginOptions struct {
 	Provider    string
 	Stage       string
 	Region      string
+	ProxyID     string
+	Proxies     *outbound.Router
 	Port        int
 	Timeout     time.Duration
 	AppVersion  string
@@ -138,6 +141,9 @@ func normalizeLoginOptions(opts LoginOptions) LoginOptions {
 }
 
 func newLoginFlow(opts LoginOptions, st *store.Store, port int) (*loginFlow, error) {
+	if !opts.Proxies.Has(opts.ProxyID) {
+		return nil, errors.New("proxy_id is not present in the proxy list")
+	}
 	state, err := randomToken()
 	if err != nil {
 		return nil, err
@@ -336,7 +342,7 @@ func (f *loginFlow) registerIDCClient(ctx context.Context, idcRegion string) (cl
 		"redirectUris": []string{f.redirectURI},
 		"issuerUrl":    f.discovery.IssuerURL,
 	}
-	raw, err := postJSON(ctx, f.oidcEndpoint(idcRegion)+"/client/register", payload, nil)
+	raw, err := postJSON(ctx, f.oidcEndpoint(idcRegion)+"/client/register", payload, nil, f.opts.Proxies, f.opts.ProxyID)
 	if err != nil {
 		return clientCredentials{}, err
 	}
@@ -376,7 +382,7 @@ func (f *loginFlow) completeLogin(ctx context.Context, q url.Values) (*store.Acc
 	if err != nil {
 		return nil, stepErrorf(http.StatusBadGateway, "token exchange failed: %v", err)
 	}
-	info, err := fetchUserInfo(ctx, f.provider, f.stage, f.discovery, f.discovery.TenantURL, t.AccessToken)
+	info, err := fetchUserInfo(ctx, f.provider, f.stage, f.discovery, f.discovery.TenantURL, t.AccessToken, f.opts.Proxies, f.opts.ProxyID)
 	if err != nil {
 		return nil, stepErrorf(http.StatusBadGateway, "user info failed: %v", err)
 	}
@@ -389,6 +395,7 @@ func (f *loginFlow) completeLogin(ctx context.Context, q url.Values) (*store.Acc
 		Provider:      f.provider,
 		BuildStage:    f.stage,
 		Region:        region,
+		ProxyID:       f.opts.ProxyID,
 		TenantURL:     f.discovery.TenantURL,
 		ClientID:      f.clientID,
 		ClientSecret:  f.secret,
@@ -437,7 +444,7 @@ func (f *loginFlow) exchangeCode(ctx context.Context, code string) (tokens, erro
 		if f.secret != "" {
 			form.Set("client_secret", f.secret)
 		}
-		raw, err := postForm(ctx, f.discovery.TokenEndpoint, form)
+		raw, err := postForm(ctx, f.discovery.TokenEndpoint, form, f.opts.Proxies, f.opts.ProxyID)
 		if err != nil {
 			return tokens{}, err
 		}
@@ -450,7 +457,7 @@ func (f *loginFlow) exchangeCode(ctx context.Context, code string) (tokens, erro
 		"code":         code,
 		"redirectUri":  f.redirectURI,
 		"codeVerifier": f.verifier,
-	}, nil)
+	}, nil, f.opts.Proxies, f.opts.ProxyID)
 	if err != nil {
 		return tokens{}, err
 	}
@@ -463,7 +470,7 @@ func (f *loginFlow) failPage(w http.ResponseWriter, status int, message string) 
 	f.finish(nil, errors.New(message))
 }
 
-func fetchUserInfo(ctx context.Context, provider, stage string, d discovery, tenantURL, accessToken string) (UserInfo, error) {
+func fetchUserInfo(ctx context.Context, provider, stage string, d discovery, tenantURL, accessToken string, proxies *outbound.Router, proxyID string) (UserInfo, error) {
 	if accessToken == "" {
 		return UserInfo{}, errors.New("token response has no access_token")
 	}
@@ -473,7 +480,7 @@ func fetchUserInfo(ctx context.Context, provider, stage string, d discovery, ten
 	}
 	raw, err := postJSON(ctx, base+"/integration/quick-work/user-info", map[string]any{}, map[string]string{
 		"Authorization": "Bearer " + accessToken,
-	})
+	}, proxies, proxyID)
 	if err != nil {
 		return UserInfo{}, err
 	}
@@ -485,7 +492,7 @@ type httpResult struct {
 	body   []byte
 }
 
-func doRequest(ctx context.Context, method, endpoint string, body io.Reader, headers map[string]string) (httpResult, error) {
+func doRequest(ctx context.Context, method, endpoint string, body io.Reader, headers map[string]string, proxies *outbound.Router, proxyID string) (httpResult, error) {
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
 		return httpResult{}, err
@@ -493,7 +500,10 @@ func doRequest(ctx context.Context, method, endpoint string, body io.Reader, hea
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client, err := proxies.Client(ctx, proxyID, 30*time.Second)
+	if err != nil {
+		return httpResult{}, err
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return httpResult{}, err
@@ -506,7 +516,7 @@ func doRequest(ctx context.Context, method, endpoint string, body io.Reader, hea
 	return httpResult{status: resp.StatusCode, body: data}, nil
 }
 
-func postJSON(ctx context.Context, endpoint string, payload any, headers map[string]string) (map[string]any, error) {
+func postJSON(ctx context.Context, endpoint string, payload any, headers map[string]string, proxies *outbound.Router, proxyID string) (map[string]any, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -515,18 +525,18 @@ func postJSON(ctx context.Context, endpoint string, payload any, headers map[str
 	for k, v := range headers {
 		h[k] = v
 	}
-	res, err := doRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(body), h)
+	res, err := doRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(body), h, proxies, proxyID)
 	if err != nil {
 		return nil, err
 	}
 	return decodeJSONResponse(endpoint, res)
 }
 
-func postForm(ctx context.Context, endpoint string, form url.Values) (map[string]any, error) {
+func postForm(ctx context.Context, endpoint string, form url.Values, proxies *outbound.Router, proxyID string) (map[string]any, error) {
 	res, err := doRequest(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()), map[string]string{
 		"Content-Type": "application/x-www-form-urlencoded",
 		"Accept":       "application/json",
-	})
+	}, proxies, proxyID)
 	if err != nil {
 		return nil, err
 	}

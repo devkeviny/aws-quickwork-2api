@@ -15,6 +15,7 @@ import (
 type settings struct {
 	Addr             string          `json:"addr"`
 	Database         string          `json:"database"`
+	ProxyID          string          `json:"proxy_id"`
 	Models           []string        `json:"models"`
 	DefaultModel     string          `json:"default_model"`
 	RequestTimeout   config.Duration `json:"request_timeout"`
@@ -38,7 +39,7 @@ type settings struct {
 
 func settingsFromConfig(cfg config.Config) settings {
 	return settings{
-		Addr: cfg.Addr, Database: cfg.Database, Models: cfg.Models, DefaultModel: cfg.DefaultModel,
+		Addr: cfg.Addr, Database: cfg.Database, ProxyID: cfg.ProxyID, Models: cfg.Models, DefaultModel: cfg.DefaultModel,
 		RequestTimeout: cfg.RequestTimeout, RefreshBefore: cfg.RefreshBefore, MaxAttempts: cfg.MaxAttempts,
 		AppVersion: cfg.AppVersion, Surface: cfg.Surface, OutpostID: cfg.OutpostID,
 		WorkingSessionID: cfg.WorkingSessionID, Timezone: cfg.Timezone, Locale: cfg.Locale,
@@ -49,7 +50,7 @@ func settingsFromConfig(cfg config.Config) settings {
 
 func (value settings) config(keys []string, path string) config.Config {
 	return config.Config{
-		Addr: value.Addr, Database: value.Database, APIKeys: keys, Models: value.Models, DefaultModel: value.DefaultModel,
+		Addr: value.Addr, Database: value.Database, ProxyID: value.ProxyID, APIKeys: keys, Models: value.Models, DefaultModel: value.DefaultModel,
 		RequestTimeout: value.RequestTimeout, RefreshBefore: value.RefreshBefore, MaxAttempts: value.MaxAttempts,
 		AppVersion: value.AppVersion, Surface: value.Surface, OutpostID: value.OutpostID,
 		WorkingSessionID: value.WorkingSessionID, Timezone: value.Timezone, Locale: value.Locale,
@@ -170,6 +171,10 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	candidate := input.Settings.config(keys, s.cfg.Path)
+	if !s.cfg.Proxies.Has(candidate.ProxyID) {
+		writeError(w, http.StatusBadRequest, "invalid_proxy", "Select an available default proxy")
+		return
+	}
 	if err := candidate.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_config", err.Error())
 		return

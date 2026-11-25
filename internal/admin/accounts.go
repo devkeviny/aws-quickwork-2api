@@ -20,6 +20,7 @@ type accountView struct {
 	Provider    string              `json:"provider"`
 	BuildStage  string              `json:"build_stage"`
 	Region      string              `json:"region"`
+	ProxyID     string              `json:"proxy_id"`
 	WSHost      string              `json:"ws_host"`
 	ExpiresAt   int64               `json:"expires_at"`
 	UseCount    int64               `json:"use_count"`
@@ -34,7 +35,8 @@ func publicAccount(account store.Account) accountView {
 	return accountView{
 		ID: account.ID, Email: account.Email, DisplayName: account.DisplayName,
 		Provider: account.Provider, BuildStage: account.BuildStage, Region: account.Region,
-		WSHost: account.WSHost, ExpiresAt: account.ExpiresAt, UseCount: account.UseCount,
+		ProxyID: account.ProxyID,
+		WSHost:  account.WSHost, ExpiresAt: account.ExpiresAt, UseCount: account.UseCount,
 		LastUsedAt: account.LastUsedAt, Disabled: account.Disabled, HasError: account.LastError != "",
 		Usage: account.Usage, Quota: account.Quota,
 	}
@@ -191,22 +193,39 @@ func (s *Server) accountID(w http.ResponseWriter, r *http.Request) (int64, bool)
 
 func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Disabled *bool `json:"disabled"`
+		Disabled *bool   `json:"disabled"`
+		ProxyID  *string `json:"proxy_id"`
 	}
-	if !decodeJSON(w, r, &input, 1024) {
+	if !decodeJSON(w, r, &input, 4096) {
 		return
 	}
-	if input.Disabled == nil {
-		writeError(w, http.StatusBadRequest, "invalid_account_update", "disabled must be specified")
+	if input.Disabled == nil && input.ProxyID == nil {
+		writeError(w, http.StatusBadRequest, "invalid_account_update", "disabled or proxy_id must be specified")
+		return
+	}
+	if input.ProxyID != nil && !s.cfg.Proxies.Has(*input.ProxyID) {
+		writeError(w, http.StatusBadRequest, "invalid_proxy", "proxy_id must reference a stored proxy, direct, or be empty")
 		return
 	}
 	accountID, ok := s.accountID(w, r)
 	if !ok {
 		return
 	}
-	if err := s.store.SetDisabled(r.Context(), accountID, *input.Disabled); err != nil {
-		writeError(w, http.StatusInternalServerError, "database_error", "Could not update account")
-		return
+	if input.ProxyID != nil {
+		if err := s.store.SetProxy(r.Context(), accountID, *input.ProxyID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusBadRequest, "invalid_proxy", "Could not bind proxy; reload the proxy list")
+			} else {
+				writeError(w, http.StatusInternalServerError, "database_error", "Could not update account")
+			}
+			return
+		}
+	}
+	if input.Disabled != nil {
+		if err := s.store.SetDisabled(r.Context(), accountID, *input.Disabled); err != nil {
+			writeError(w, http.StatusInternalServerError, "database_error", "Could not update account")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

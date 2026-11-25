@@ -162,6 +162,11 @@ tbody tr:last-child td { border-bottom: none; }
 .credit-list { display: flex; flex-wrap: wrap; gap: 12px; }
 .credit-item { padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-alt); }
 .credit-item .cell-note { max-width: none; overflow: visible; white-space: normal; }
+.proxy-list { display: grid; gap: 8px; margin-top: 16px; }
+.proxy-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.proxy-item > div { min-width: 0; overflow-wrap: anywhere; }
+.proxy-item code { display: block; color: var(--muted); font-size: 12px; user-select: all; }
+.proxy-item button { flex-shrink: 0; }
 .credit-details { margin-top: 9px; }
 .credit-details summary { color: var(--primary); font-size: 11px; cursor: pointer; }
 .credit-details .credit-item { margin-top: 8px; padding: 7px 10px; }

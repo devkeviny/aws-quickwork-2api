@@ -40,8 +40,6 @@ func attachErr(format string, args ...any) error {
 	return &attachmentError{err: fmt.Errorf(format, args...)}
 }
 
-var attachmentHTTPClient = &http.Client{Timeout: 2 * time.Minute}
-
 // attachmentRef is the metadata referenced from user_message.payload.attachments.
 type attachmentRef struct {
 	ID   string
@@ -104,6 +102,10 @@ func uploadPromptAttachment(ctx context.Context, sess *Session, threadID, name s
 	if len(data) == 0 {
 		return ref, attachErr("attachment upload: empty prompt")
 	}
+	client, err := sess.Proxies.Client(ctx, sess.ProxyID, 2*time.Minute)
+	if err != nil {
+		return ref, err
+	}
 
 	// 1. Upload the raw bytes. The tenant returns an attachment id and starts
 	// the DLP scan.
@@ -118,7 +120,7 @@ func uploadPromptAttachment(ctx context.Context, sess *Session, threadID, name s
 	}
 	setAttachmentHeaders(req, token)
 	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := attachmentHTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return ref, attachErr("attachment upload: %v", err)
 	}
@@ -147,7 +149,7 @@ func uploadPromptAttachment(ctx context.Context, sess *Session, threadID, name s
 	// 2. Wait for the DLP verdict. WARN requires an interactive acknowledgement
 	// in the desktop app, so it is treated as blocked for an API relay.
 	if ref.ID != "" {
-		if err := waitAttachmentDLP(ctx, base, token, ref.ID); err != nil {
+		if err := waitAttachmentDLP(ctx, client, base, token, ref.ID); err != nil {
 			return ref, err
 		}
 	}
@@ -157,7 +159,7 @@ func uploadPromptAttachment(ctx context.Context, sess *Session, threadID, name s
 
 	// 3. Bind the attachment to the conversation workspace. Without this path
 	// the model cannot see the file.
-	path, err := deliverAttachment(ctx, base, token, threadID, ref.ID)
+	path, err := deliverAttachment(ctx, client, base, token, threadID, ref.ID)
 	if err != nil {
 		return ref, err
 	}
@@ -165,7 +167,7 @@ func uploadPromptAttachment(ctx context.Context, sess *Session, threadID, name s
 	return ref, nil
 }
 
-func waitAttachmentDLP(ctx context.Context, base, token, attachmentID string) error {
+func waitAttachmentDLP(ctx context.Context, client *http.Client, base, token, attachmentID string) error {
 	query := "/integration/quick-work/attachment-dlp-status?attachmentId=" + url.QueryEscape(attachmentID)
 	for attempt := range attachmentPollAttempts {
 		if attempt > 0 {
@@ -180,7 +182,7 @@ func waitAttachmentDLP(ctx context.Context, base, token, attachmentID string) er
 			return attachErr("attachment DLP request: %v", err)
 		}
 		setAttachmentHeaders(req, token)
-		resp, err := attachmentHTTPClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return attachErr("attachment DLP: %v", err)
 		}
@@ -220,7 +222,7 @@ func waitAttachmentDLP(ctx context.Context, base, token, attachmentID string) er
 	return attachErr("attachment DLP scan did not settle")
 }
 
-func deliverAttachment(ctx context.Context, base, token, threadID, attachmentID string) (string, error) {
+func deliverAttachment(ctx context.Context, client *http.Client, base, token, threadID, attachmentID string) (string, error) {
 	// The envelope's body is the already-decoded JSON document: the DataPlane
 	// deserializes invokeAgent verbatim (buildInvokeAgentEnvelope in the desktop
 	// main process parses the renderer's body string before sending it).
@@ -243,7 +245,7 @@ func deliverAttachment(ctx context.Context, base, token, threadID, attachmentID 
 	}
 	setAttachmentHeaders(req, token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := attachmentHTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", attachErr("attachment deliver: %v", err)
 	}

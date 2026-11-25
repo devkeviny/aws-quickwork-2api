@@ -23,6 +23,7 @@ type Account struct {
 	Provider    string `json:"provider"`
 	BuildStage  string `json:"build_stage"`
 	Region      string `json:"region"`
+	ProxyID     string `json:"proxy_id"`
 
 	TenantURL string `json:"tenant_url"`
 	WSHost    string `json:"ws_host"`
@@ -125,6 +126,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 	provider       TEXT NOT NULL DEFAULT '',
 	build_stage    TEXT NOT NULL DEFAULT 'prod',
 	region         TEXT NOT NULL DEFAULT '',
+	proxy_id       TEXT NOT NULL DEFAULT '',
 	tenant_url     TEXT NOT NULL DEFAULT '',
 	ws_host        TEXT NOT NULL DEFAULT '',
 	ws_path        TEXT NOT NULL DEFAULT '',
@@ -153,6 +155,12 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email_tenant ON accounts(email, tenant_url);
 CREATE INDEX IF NOT EXISTS idx_accounts_enabled ON accounts(disabled, id);
+CREATE TABLE IF NOT EXISTS proxies (
+	id TEXT PRIMARY KEY,
+	url TEXT NOT NULL,
+	label TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS account_metrics (
 	account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
 	call_count INTEGER NOT NULL DEFAULT 0,
@@ -183,11 +191,36 @@ CREATE TABLE IF NOT EXISTS account_credits (
 	PRIMARY KEY (account_id, unit)
 );
 `
-	_, err := s.db.Exec(schema)
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	rows, err := s.db.Query(`PRAGMA table_info(accounts)`)
+	if err != nil {
+		return err
+	}
+	proxyColumn := false
+	for rows.Next() {
+		var index, required, primary int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&index, &name, &dataType, &required, &defaultValue, &primary); err != nil {
+			rows.Close()
+			return err
+		}
+		proxyColumn = proxyColumn || name == "proxy_id"
+	}
+	rowErr := rows.Err()
+	rows.Close()
+	if rowErr != nil {
+		return rowErr
+	}
+	if !proxyColumn {
+		_, err = s.db.Exec(`ALTER TABLE accounts ADD COLUMN proxy_id TEXT NOT NULL DEFAULT ''`)
+	}
 	return err
 }
 
-const columns = `id, email, display_name, provider, build_stage, region,
+const columns = `id, email, display_name, provider, build_stage, region, proxy_id,
 	tenant_url, ws_host, ws_path, access_token, refresh_token, id_token,
 	actor_arn, aws_account_id, account_name, client_id, client_secret,
 	issuer_url, idc_region, auth_endpoint, token_endpoint, redirect_uri,
@@ -214,7 +247,7 @@ func scanAccount(row scanner) (*Account, error) {
 	var metricsJSON, quotaJSON, quotaError, creditsJSON string
 	var syncedAt, attemptedAt int64
 	err := row.Scan(
-		&a.ID, &a.Email, &a.DisplayName, &a.Provider, &a.BuildStage, &a.Region,
+		&a.ID, &a.Email, &a.DisplayName, &a.Provider, &a.BuildStage, &a.Region, &a.ProxyID,
 		&a.TenantURL, &a.WSHost, &a.WSPath, &a.AccessToken, &a.RefreshToken, &a.IDToken,
 		&a.ActorARN, &a.AWSAccountID, &a.AccountName, &a.ClientID, &a.ClientSecret,
 		&a.IssuerURL, &a.IDCRegion, &a.AuthEndpoint, &a.TokenEndpoint, &a.RedirectURI,
@@ -251,18 +284,20 @@ func (s *Store) Save(ctx context.Context, a *Account) error {
 		disabled = 1
 	}
 	const q = `
-INSERT INTO accounts (email, display_name, provider, build_stage, region,
+INSERT INTO accounts (email, display_name, provider, build_stage, region, proxy_id,
 	tenant_url, ws_host, ws_path, access_token, refresh_token, id_token,
 	actor_arn, aws_account_id, account_name, client_id, client_secret,
 	issuer_url, idc_region, auth_endpoint, token_endpoint, redirect_uri,
 	user_info, expires_at, obtained_at, created_at, updated_at,
 	last_used_at, use_count, disabled, last_error)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+WHERE ? IN ('', 'direct') OR EXISTS (SELECT 1 FROM proxies WHERE id=?)
 ON CONFLICT(email, tenant_url) DO UPDATE SET
 	display_name=excluded.display_name,
 	provider=excluded.provider,
 	build_stage=excluded.build_stage,
 	region=excluded.region,
+	proxy_id=CASE WHEN excluded.proxy_id='' THEN accounts.proxy_id ELSE excluded.proxy_id END,
 	ws_host=excluded.ws_host,
 	ws_path=excluded.ws_path,
 	access_token=excluded.access_token,
@@ -284,15 +319,19 @@ ON CONFLICT(email, tenant_url) DO UPDATE SET
 	updated_at=excluded.updated_at,
 	disabled=0,
 	last_error=''
-RETURNING id`
+RETURNING id, proxy_id`
 	err := s.db.QueryRowContext(ctx, q,
-		a.Email, a.DisplayName, a.Provider, a.BuildStage, a.Region,
+		a.Email, a.DisplayName, a.Provider, a.BuildStage, a.Region, a.ProxyID,
 		a.TenantURL, a.WSHost, a.WSPath, a.AccessToken, a.RefreshToken, a.IDToken,
 		a.ActorARN, a.AWSAccountID, a.AccountName, a.ClientID, a.ClientSecret,
 		a.IssuerURL, a.IDCRegion, a.AuthEndpoint, a.TokenEndpoint, a.RedirectURI,
 		a.UserInfo, a.ExpiresAt, a.ObtainedAt, a.CreatedAt, a.UpdatedAt,
 		a.LastUsedAt, a.UseCount, disabled, a.LastError,
-	).Scan(&a.ID)
+		a.ProxyID, a.ProxyID,
+	).Scan(&a.ID, &a.ProxyID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errors.New("bound proxy is unavailable")
+	}
 	return err
 }
 

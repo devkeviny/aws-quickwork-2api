@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 
+	"quickwork-openai/internal/outbound"
 	"quickwork-openai/internal/store"
 )
 
@@ -14,7 +15,7 @@ var ErrNoRefreshToken = errors.New("no refresh_token stored; run login again")
 
 // Refresh renews an account's tokens and returns an updated copy. The caller
 // persists it with Store.Update.
-func Refresh(ctx context.Context, a *store.Account) (*store.Account, error) {
+func Refresh(ctx context.Context, a *store.Account, proxies *outbound.Router) (*store.Account, error) {
 	if a == nil {
 		return nil, errors.New("account is nil")
 	}
@@ -41,7 +42,7 @@ func Refresh(ctx context.Context, a *store.Account) (*store.Account, error) {
 		if out.ClientSecret != "" {
 			form.Set("client_secret", out.ClientSecret)
 		}
-		raw, err = postForm(ctx, out.TokenEndpoint, form)
+		raw, err = postForm(ctx, out.TokenEndpoint, form, proxies, out.ProxyID)
 	default:
 		endpoint := out.TokenEndpoint
 		if endpoint == "" {
@@ -59,7 +60,7 @@ func Refresh(ctx context.Context, a *store.Account) (*store.Account, error) {
 			"clientSecret": out.ClientSecret,
 			"grantType":    "refresh_token",
 			"refreshToken": out.RefreshToken,
-		}, nil)
+		}, nil, proxies, out.ProxyID)
 	}
 	if err != nil {
 		return nil, err
@@ -76,7 +77,7 @@ func Refresh(ctx context.Context, a *store.Account) (*store.Account, error) {
 		TenantURL: out.TenantURL,
 		Region:    out.Region,
 	}
-	info, infoErr := fetchUserInfo(ctx, provider, out.BuildStage, d, out.TenantURL, t.AccessToken)
+	info, infoErr := fetchUserInfo(ctx, provider, out.BuildStage, d, out.TenantURL, t.AccessToken, proxies, out.ProxyID)
 	if infoErr != nil {
 		// The token endpoint already accepted the refresh. Do not throw away
 		// a valid session because the profile endpoint is transiently down;

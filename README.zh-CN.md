@@ -22,6 +22,7 @@
 - WebUI 支持 English / 简体中文切换；界面语言不改变上游请求的 `locale` 配置
 - 独立管理密码、HttpOnly 会话 Cookie、CSRF 防护和登录限流；管理密码与推理 API key 分离
 - Docker 多阶段构建与 Compose 部署，非 root 运行并持久化账号和配置
+- WebUI 批量导入 HTTP / SOCKS5 代理，SQLite 持久化，支持逐账号出站绑定
 - 默认复用上游会话（`session_reuse=true`）；设为 `false` 时每轮结束删除会话，避免污染聊天列表
 - 会话复用：同一段对话固定上游 thread 与账号，每轮只送新增消息，避免重送整份 transcript 撞 64 KB 上限；可用 `X-Conversation-Id` / `X-Thread-Id` 显式指定会话
 - 客户端 `tools` / `functions` 通过 `<caller_tool_interface>` 文本协议桥接；代理解析 `<client_tool_call>` 并返回 OpenAI `tool_calls`，实际执行仍在客户端
@@ -41,6 +42,8 @@
 - 不需要 Python、Node.js、npm、官方桌面应用或 outpost 进程
 
 ## 快速开始
+
+可直接从 [Releases](https://github.com/jasonxu114514/aws-quickwork-2api/releases/tag/v0.5.0) 下载 **v0.5.0**，或从源码构建。提供 Windows / Linux / macOS 的 amd64、arm64 二进制；下载后用 `SHA256SUMS` 核对完整性，执行 `quickproxy version` 查看内嵌版本与提交。更新内容见 [发行说明](CHANGELOG.md)。
 
 ### 1. 构建
 
@@ -146,11 +149,16 @@ for chunk in client.chat.completions.create(
 
 仓库提供 `Dockerfile`、`compose.yaml` 和白名单式 `.dockerignore`。构建上下文只包含 Go 源码、模块文件和内嵌 WebUI 资源，不包含本地配置、数据库或登录状态。
 
-先通过部署环境设置 `QUICKPROXY_ADMIN_PASSWORD`（12–1024 字节），然后在项目目录运行：
+先通过部署环境设置 `QUICKPROXY_ADMIN_PASSWORD`（12–1024 字节），然后在项目目录拉取并启动已发布镜像：
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d --no-build
 ```
+
+Compose 默认使用 `ghcr.io/jasonxu114514/aws-quickwork-2api:v0.5.0`，支持 Linux amd64、arm64；同时提供 `0.5.0`、`0.5`、`latest` 标签。可用 `QUICKPROXY_IMAGE` 指定其他标签，或使用 Release 的 `container-image.txt` 中记录的不可变 digest。公开 GHCR 镜像拉取不需要 Docker Hub 账号。
+
+如需构建当前检出的源码，运行 `docker compose up -d --build`。本地构建的 `QUICKPROXY_VERSION` 仅控制版本元数据，默认 `v0.5.0`，不会切换 Git 提交。独立构建可用 `docker build --build-arg VERSION=v0.5.0 -t quickwork-openai:local .`。
 
 打开 `http://127.0.0.1:8080/`，使用管理密码登录，再在账号页面添加上游账号。Compose 默认只把容器端口发布到主机 loopback；可通过 `QUICKPROXY_PORT` 修改主机端口。容器内仍监听 `0.0.0.0:8080`。
 
@@ -159,6 +167,7 @@ docker compose up -d --build
 - 命名卷 `quickproxy-data` 挂载到 `/app/data`；首次运行生成 `/app/data/config.json`。
 - 默认数据库相对配置文件目录解析，因此容器内路径为 `/app/data/data/quickwork.db`；如希望改为 `/app/data/quickwork.db`，把配置中的 `database` 设置为 `quickwork.db` 后重启。
 - 已有配置和数据库不会在重新构建镜像或重启时覆盖；不要用删除卷的方式升级。
+- 升级前备份配置与 SQLite 数据库，启动时自动迁移 schema；代理列表及绑定同样保存在此数据库与数据卷内。
 - 进程以 UID/GID `10001:10001` 运行。使用 bind mount 替代命名卷时，需要预先授予该用户数据目录写权限。
 - Compose 使用只读根文件系统、丢弃全部 Linux capabilities、`no-new-privileges` 和临时 `/tmp`。
 - 健康检查只调用容器内 `/healthz`，不会访问上游，也不要求已有账号。
@@ -183,6 +192,12 @@ docker compose restart quickproxy
 docker build -t quickwork-openai:local .
 ```
 
+### CI 与发布
+
+`ci` 工作流编译 Go、运行 `go vet`、检查本次变更 Go 源码的格式和 JavaScript 语法，并在 GitHub 原生 runner 上分别构建两种 Linux 架构的容器镜像。不启动应用、不探测代理、不执行 smoke test。
+
+推送稳定版 `vMAJOR.MINOR.PATCH` 标签触发 `release`；手动触发必须在 `tag` 输入中指定已有标签。所有构建固定到该标签提交，生成六个平台二进制及 GHCR 多架构镜像，全部完成后才发布 GitHub Release。镜像路径由仓库名生成，工作流使用按任务授予 `packages: write` 的 `GITHUB_TOKEN` 发布，无需另配仓库密码。第三方 Actions 均固定到 commit SHA。失败后可重跑同一标签，无需移动标签。
+
 ## WebUI
 
 WebUI 默认启用，与 OpenAI 兼容 API 共用监听地址。配置 `webui.enabled=false` 后重启可关闭管理页面与管理 API，不影响推理 API。
@@ -205,13 +220,42 @@ WebUI 默认启用，与 OpenAI 兼容 API 共用监听地址。配置 `webui.en
 
 ### 在 WebUI 添加账号
 
-1. 进入账号页面，选择 provider / stage，需要时填写 region，然后开始登录。
+1. 进入账号页面，选择 provider / stage，需要时填写 region 并选择出站代理，然后开始登录。
 2. 打开 discovery 链接并完成浏览器登录。
 3. 浏览器跳到 `localhost` 回调页后，从地址栏复制完整 URL，粘贴到 WebUI 提交；回调页无法打开是正常现象。
 4. 打开页面返回的 authorize 链接，完成授权，再粘贴最终包含 `code` 和 `state` 的完整回调 URL。
 5. 成功后账号写入 SQLite 并更新列表。可取消流程；超时后重新开始。
 
 回调 URL 含临时授权数据，请勿提交到聊天、日志或工单。WebUI 不保存或显示账号 token、refresh token、client secret。
+
+### 出站代理
+
+在 **账号 → 出站代理** 粘贴代理列表，每行一个 URL，点击 **导入代理**。代理保存到当前配置的 SQLite 数据库，不依赖代理文件。支持以下格式：
+
+```text
+http://proxy.example.com:8080
+http://USER:PASS@proxy.example.com:8080
+socks5://proxy.example.com:1080
+socks5://USER:PASS@proxy.example.com:1080
+```
+
+用户名和密码中的特殊字符需要 URL 百分号编码，例如 `@` 写为 `%40`。空行及以 `#` 开头的行会忽略。导入为原子操作：任何一行无效则整批拒绝，规范化后重复的代理会跳过。每批最多 1,000 个不同代理，JSON 请求体上限为 1 MB。
+
+- 在账号行选择已保存的代理，或在开始浏览器 OAuth 前选择代理。登录请求、Token 刷新、用户信息、官方用量、上游 WebSocket、附件上传、DLP 轮询和附件事件均使用所选线路。浏览器自身的页面导航仍使用浏览器的网络配置。
+- **继承默认／环境代理** 使用 `config.json` 可选的 `proxy_id`；全局值为空时保留现有进程环境代理行为。**直连**（`"direct"`）忽略环境代理。账号显式绑定优先于全局默认；绑定失效时返回错误，不静默回退到其他线路。
+- 导入和账号绑定变更无需重启，对后续出站请求生效，已经进行中的请求保留原线路。列表中脱敏地址下方显示完整代理 ID；复制到服务设置中的 `proxy_id`，保存并重启即可设为全局默认。
+- 重新认证时未显式选择代理会保留账号已有绑定；要清除绑定，请在账号行选择 **继承**。删除代理前须解除账号绑定，并移除运行中及已保存配置的默认引用。
+- 代理凭证与账号凭证一样以 **未加密形式保存在 SQLite**。请保护数据库及其备份，远程访问 WebUI 时使用 HTTPS。列表只返回 ID 和不含用户信息的地址，不回传已保存的代理凭证；导入文本框在提交时清空。
+
+代理管理端点沿用管理会话鉴权，写操作校验来源与 CSRF：
+
+| 端点 | 用途 |
+|---|---|
+| `GET /api/proxies` | 返回 `{proxies: [{id, label}]}`，不含凭证 |
+| `POST /api/proxies/import` | 导入 `{"proxies":"http://proxy.example.com:8080\nsocks5://proxy.example.com:1080"}`，返回 `{imported: N}` |
+| `DELETE /api/proxies/{id}` | 删除未被引用的代理；仍被引用时返回 `409 proxy_in_use` |
+| `PATCH /api/accounts/{id}` | 设置 `{"proxy_id":"<已保存 ID>"}`、`{"proxy_id":"direct"}` 或 `{"proxy_id":""}` |
+| `POST /api/logins` | 可选 `proxy_id` 指定登录线路并绑定登录后的账号 |
 
 ### 账号统计与官方用量
 
@@ -251,6 +295,7 @@ WebUI 默认启用，与 OpenAI 兼容 API 共用监听地址。配置 `webui.en
 {
   "addr": "127.0.0.1:8080",
   "database": "data/quickwork.db",
+  "proxy_id": "",
   "api_keys": [],
   "models": ["smart", "fast", "balanced", "auto"],
   "default_model": "smart",
@@ -291,6 +336,7 @@ WebUI 默认启用，与 OpenAI 兼容 API 共用监听地址。配置 `webui.en
 |---|---|---|
 | `addr` | `127.0.0.1:8080` | HTTP 监听地址 |
 | `database` | `data/quickwork.db` | SQLite 文件；相对路径基于 `config.json` 所在目录 |
+| `proxy_id` | 空 | 全局默认：已保存代理 ID 或 `direct`；空值保留进程环境代理行为；编辑后重启 |
 | `api_keys` | `[]` | 允许的本地 API key；为空时关闭鉴权 |
 | `models` | `smart,fast,balanced,auto` | `/v1/models` 返回值与 model 白名单 |
 | `default_model` | `smart` | 未知 model 的映射 |
@@ -343,6 +389,7 @@ WebUI 默认启用，与 OpenAI 兼容 API 共用监听地址。配置 `webui.en
 | `quickproxy refresh -account ID` | 只刷新一个账号 |
 | `quickproxy logout -all` | 删除全部账号 |
 | `quickproxy logout -account ID` | 删除一个账号 |
+| `quickproxy version` | 显示构建版本与源码提交，不读取配置 |
 
 所有命令都支持 `-config PATH`，默认 `config.json`。
 
@@ -359,6 +406,7 @@ WebUI 默认启用，与 OpenAI 兼容 API 共用监听地址。配置 `webui.en
 | `-timeout` | `config.oauth.timeout` | 等待浏览器完成登录的超时 |
 | `-open` | 关闭 | 同时用默认浏览器打开 URL |
 | `-manual` | 关闭 | 不监听本地回调端口，手动粘贴浏览器地址栏中的 callback URL（适合服务器） |
+| `-proxy-id` | 空 | 已保存代理 ID 或 `direct`；空值继承全局默认／环境代理；显式选择后绑定账号 |
 
 ## 多账号轮询
 
@@ -484,10 +532,31 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 | 登录页面报错 | 查看终端输出的错误；确认 `-provider` 与账号类型匹配 |
 | 多账号请求总是失败 | 运行 `quickproxy accounts` 查看 `last_error`；对失效账号重新 `login` 或 `logout -account ID` |
 | token 过期 | 通常自动刷新；也可运行 `quickproxy refresh` |
+| Social 登录获取用户信息时出现 `net/http: TLS handshake timeout` | 参见下方按进程启用的 TLS 兼容性临时方案；未受影响时保留默认 TLS 设置 |
 | WebUI 提示未配置管理密码 | 在启动服务的环境中设置 `QUICKPROXY_ADMIN_PASSWORD`（12–1024 字节），然后重启 |
 | WebUI 登录成功但无法调用 Playground | 如已配置 `api_keys`，需在 Playground 单独填入推理 API key；管理密码不是 API key |
 | WebUI 保存配置后行为未改变 | 保存仅写磁盘；重启服务。监听地址还受 `server -addr` 覆盖 |
 | Docker 内没有账号或数据不见 | 确认使用同一命名卷和 `/app/data/config.json`；默认数据库为 `/app/data/data/quickwork.db` |
+
+### TLS 握手兼容性
+
+Issue #10 报告：macOS arm64、Go 1.26.11 下，social 登录在获取用户信息时 TLS 握手超时；独立 Go HTTP 客户端访问相同主机也能复现，按进程关闭混合 ML-KEM 密钥交换后恢复。目前无法确认原因在 AWS 端点还是中间网络，此方案并不适用于所有 TLS 超时。
+
+如遇到该症状，可临时使用以下设置分别启动登录和服务器（POSIX shell）：
+
+```sh
+GODEBUG=tlsmlkem=0 ./bin/quickproxy login --provider social -open
+GODEBUG=tlsmlkem=0 ./bin/quickproxy server
+```
+
+PowerShell 可通过子进程执行，不将设置保留在当前会话：
+
+```powershell
+cmd /c "set GODEBUG=tlsmlkem=0&& bin\quickproxy.exe login --provider social -open"
+cmd /c "set GODEBUG=tlsmlkem=0&& bin\quickproxy.exe server"
+```
+
+项目继续使用 Go 默认 TLS 行为；此兼容方案仅在主动启用时改变密钥交换，**不会关闭证书验证**。如果已有其他 `GODEBUG` 选项，请在逗号分隔的值中保留它们，不再需要时移除此临时设置。参见 [Go 官方 TLS 兼容性说明](https://go.dev/doc/go1.24#crypto/tls)。
 
 ## 目录
 
@@ -500,7 +569,8 @@ quickwork-openai/
   internal/config/         config.json 加载与默认值
   internal/oauth/          原生 OAuth、PKCE、token refresh、user info
   internal/oauth/browser.go WebUI 复用的分阶段手动 callback 登录
-  internal/store/          SQLite 账号存储
+  internal/store/          SQLite 账号、代理列表与绑定存储
+  internal/outbound/       共享 HTTP / SOCKS5 出站路由
   internal/accounts/       多账号轮询与自动刷新
   internal/proxy/          WebSocket codec、OpenAI handler
   data/quickwork.db        运行期账号库（gitignored）

@@ -151,6 +151,9 @@ func (m *Manager) NextPinned(ctx context.Context, id int64) (*store.Account, err
 }
 
 func (m *Manager) ensureFresh(ctx context.Context, a *store.Account) (*store.Account, error) {
+	if !m.cfg.Proxies.Has(a.ProxyID) {
+		return nil, errors.New("bound proxy is no longer present in the proxy list")
+	}
 	if !a.Expiring(time.Now(), m.cfg.RefreshBefore.Duration()) {
 		if a.JWT() == "" {
 			return nil, errors.New("account has no access token")
@@ -179,7 +182,7 @@ func (m *Manager) ensureFresh(ctx context.Context, a *store.Account) (*store.Acc
 
 // refreshLocked refreshes and persists one account. The caller holds its lock.
 func (m *Manager) refreshLocked(ctx context.Context, a *store.Account) (*store.Account, error) {
-	refreshed, err := oauth.Refresh(ctx, a)
+	refreshed, err := oauth.Refresh(ctx, a, m.cfg.Proxies)
 	if err != nil {
 		return nil, err
 	}

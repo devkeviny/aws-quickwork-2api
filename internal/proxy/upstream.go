@@ -133,7 +133,10 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		return ChatResult{}, err
 	}
 
-	dialer := *websocket.DefaultDialer
+	dialer, err := u.cfg.Proxies.Dialer(ctx, sess.ProxyID)
+	if err != nil {
+		return ChatResult{}, err
+	}
 	dialer.HandshakeTimeout = 20 * time.Second
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {

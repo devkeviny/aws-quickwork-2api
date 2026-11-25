@@ -135,12 +135,11 @@ func FetchUsage(ctx context.Context, account *store.Account, cfg *config.Config)
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Authorization", "Bearer "+account.JWT())
 	request.Header.Set("x-amzn-qs-internal-trace-id", traceID)
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+	client, err := cfg.Proxies.Client(ctx, account.ProxyID, 30*time.Second)
+	if err != nil {
+		return nil, err
 	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, usageTransportError(ctx)

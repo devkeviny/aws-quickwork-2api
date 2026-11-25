@@ -18,6 +18,7 @@ A single Go executable handles native OAuth / PKCE login, SQLite account storage
 - Embedded English / Simplified Chinese WebUI: overview, account management, browser-based remote login, configuration editing, and a non-streaming Playground.
 - Management sessions with HttpOnly cookies, CSRF protection, origin checks, and login rate limiting.
 - Multi-stage Docker image and hardened Compose deployment with persistent configuration and accounts.
+- WebUI bulk import of HTTP / SOCKS5 proxies, SQLite persistence, and per-account outbound routing.
 - Upstream session reuse with pinned accounts and incremental conversation history; explicit `X-Conversation-Id` / `X-Thread-Id` support.
 - Client-side tool bridging for `tools`, `functions`, `tool_choice`, and parallel calls. The proxy returns OpenAI `tool_calls`; it never executes tools.
 - Upstream usage reporting, including `prompt_tokens_details.cached_tokens`.
@@ -32,6 +33,8 @@ A single Go executable handles native OAuth / PKCE login, SQLite account storage
 - A browser. Automatic CLI callbacks require it to reach the CLI machine's callback port, normally `18080`; WebUI and `login -manual` do not.
 
 ## Quick Start
+
+Download the **v0.5.0** binary for your OS and CPU from [Releases](https://github.com/jasonxu114514/aws-quickwork-2api/releases/tag/v0.5.0), or build from source. Windows, Linux, and macOS binaries are provided for amd64 and arm64. Verify downloads against `SHA256SUMS`; `quickproxy version` reports the embedded version and commit. See [release notes](CHANGELOG.md).
 
 ### 1. Build
 
@@ -126,11 +129,16 @@ for chunk in client.chat.completions.create(
 
 The repository includes a multi-stage `Dockerfile`, `compose.yaml`, and an allowlist-based `.dockerignore`. Only module files, required Go sources, and embedded UI assets enter the build context—not local configuration, databases, or login state.
 
-Set `QUICKPROXY_ADMIN_PASSWORD` in your deployment environment first, then run:
+Set `QUICKPROXY_ADMIN_PASSWORD` in your deployment environment first, then pull and run the published image:
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d --no-build
 ```
+
+Compose defaults to `ghcr.io/jasonxu114514/aws-quickwork-2api:v0.5.0`, with Linux amd64 and arm64 images. The registry also provides `0.5.0`, `0.5`, and `latest` tags. Override `QUICKPROXY_IMAGE` to pin another tag or the immutable digest recorded in the release's `container-image.txt`. Docker Hub credentials are not required for public GHCR pulls.
+
+To build the checked-out source instead, run `docker compose up -d --build`. Local builds use `QUICKPROXY_VERSION` for version metadata (default `v0.5.0`); this does not choose a Git revision. For standalone builds, use `docker build --build-arg VERSION=v0.5.0 -t quickwork-openai:local .`.
 
 Open `http://127.0.0.1:8080/`, sign in with the administrator password, and add upstream accounts from the Accounts page. `QUICKPROXY_PORT` changes the published host port; the container still listens on `0.0.0.0:8080`. Compose publishes to the host's loopback interface by default.
 
@@ -139,6 +147,7 @@ Deployment details:
 - Named volume `quickproxy-data` mounts at `/app/data`; first use creates `/app/data/config.json`.
 - Relative database paths resolve against the configuration directory. The default database is therefore **`/app/data/data/quickwork.db`**. Set `database` to `quickwork.db` and restart to use `/app/data/quickwork.db` instead.
 - Existing configuration and account data survive image rebuilds and restarts. Do not remove the volume during upgrades.
+- Back up the configuration and SQLite database before upgrading; schema changes are applied automatically at startup. Proxy inventory and bindings share the same database and volume.
 - The process runs as UID/GID `10001:10001`. A bind-mounted data directory must already be writable by this user.
 - Compose uses a read-only root filesystem, drops all Linux capabilities, enables `no-new-privileges`, and provides a temporary `/tmp`.
 - The health check calls only `/healthz` inside the container; it does not contact the upstream service or require accounts.
@@ -163,6 +172,12 @@ To build the image separately:
 docker build -t quickwork-openai:local .
 ```
 
+### CI and Releases
+
+The `ci` workflow compiles Go, runs `go vet`, checks formatting of changed Go sources and JavaScript syntax, and builds both Linux container architectures on native GitHub runners. It does not run the application, probe proxy endpoints, or perform smoke tests.
+
+Pushing a stable `vMAJOR.MINOR.PATCH` tag starts `release`. Manual dispatch requires an existing tag in the `tag` input. The workflow pins the tag's commit for every build, produces six binaries and multi-platform GHCR images, and publishes the GitHub Release after all distribution builds succeed. The registry path is derived from the repository name; publication uses the workflow's `GITHUB_TOKEN` with job-scoped `packages: write`, without a separate registry secret. All third-party Actions are pinned to commit SHAs. A failed run can be rerun for the same tag without moving it.
+
 ## WebUI
 
 The embedded WebUI uses the same listener as the inference API. Set `webui.enabled` to `false` and restart to disable both the UI and management API without disabling inference.
@@ -185,13 +200,42 @@ The embedded WebUI uses the same listener as the inference API. Set `webui.enabl
 
 ### Add an Account in the Browser
 
-1. Choose a provider and build stage on the Accounts page; enter a region when needed.
+1. Choose a provider and build stage on the Accounts page; enter a region and select an outbound proxy when needed.
 2. Start login, open the discovery link, and sign in.
 3. Copy the complete `localhost` callback URL from the browser address bar and submit it to the WebUI. An unreachable callback page is expected on a remote machine.
 4. Open the returned authorize link, finish authorization, and submit the final complete callback URL containing `code` and `state`.
 5. The account is stored in SQLite and the list updates. Cancel an unfinished flow or restart it after expiry.
 
 Callback URLs contain temporary authorization data: do not share them in chat, logs, or issue reports. Account tokens, refresh tokens, and client secrets are not returned by the management API.
+
+### Outbound Proxies
+
+On **Accounts → Outbound proxies**, paste one proxy URL per line and choose **Import proxies**. Entries are stored in the configured SQLite database, not a proxy file. Supported formats include:
+
+```text
+http://proxy.example.com:8080
+http://USER:PASS@proxy.example.com:8080
+socks5://proxy.example.com:1080
+socks5://USER:PASS@proxy.example.com:1080
+```
+
+Percent-encode special characters in usernames and passwords, such as `%40` for `@`. Empty lines and lines starting with `#` are ignored. Imports are atomic: invalid entries reject the entire batch; canonical duplicates are skipped. Each import accepts up to 1,000 distinct proxies, with a 1 MB JSON request limit.
+
+- Select a stored proxy on each account row, or select it before starting browser OAuth. Login requests, token refresh, user information, official usage, upstream WebSocket connections, attachment uploads, DLP polling, and attachment events use that route. The browser's own navigation still uses the browser's network configuration.
+- **Inherit default / environment** uses the optional `config.json` `proxy_id`. If that is empty, existing process environment proxy behavior is preserved. **Direct** (`"direct"`) bypasses environment proxies. Explicit account bindings override the global default; unavailable bindings fail rather than silently falling back.
+- Imports and account binding changes apply to subsequent outbound requests without restarting. Requests already in flight keep their route. The full proxy ID is displayed beneath its sanitized address; copy it into `proxy_id` in Settings to select a global default, then save and restart.
+- Reauthentication without an explicit proxy selection preserves an existing account binding. To clear it, choose **Inherit** on the account row. Unbind accounts and remove any running or saved default reference before deleting a proxy.
+- Credentials are stored **unencrypted in SQLite**, alongside account credentials. Protect the database and its backups, and use HTTPS when accessing the WebUI remotely. Listings return only IDs and addresses without user information; they never return stored proxy credentials. The import textarea is cleared on submission.
+
+Proxy management endpoints use the same management session, origin checks, and CSRF protection as other management writes:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/proxies` | List `{proxies: [{id, label}]}` without credentials |
+| `POST /api/proxies/import` | Import `{"proxies":"http://proxy.example.com:8080\nsocks5://proxy.example.com:1080"}`; returns `{imported: N}` |
+| `DELETE /api/proxies/{id}` | Delete an unbound proxy; returns `409 proxy_in_use` while referenced |
+| `PATCH /api/accounts/{id}` | Set `{"proxy_id":"<stored ID>"}`, `{"proxy_id":"direct"}`, or `{"proxy_id":""}` |
+| `POST /api/logins` | Optional `proxy_id` chooses the login route and binds the resulting account |
 
 ### Account Statistics and Official Usage
 
@@ -231,6 +275,7 @@ Commands create `config.json` with defaults if it does not exist. Relative datab
 {
   "addr": "127.0.0.1:8080",
   "database": "data/quickwork.db",
+  "proxy_id": "",
   "api_keys": [],
   "models": ["smart", "fast", "balanced", "auto"],
   "default_model": "smart",
@@ -271,6 +316,7 @@ Commands create `config.json` with defaults if it does not exist. Relative datab
 |---|---|---|
 | `addr` | `127.0.0.1:8080` | Shared API / WebUI listener |
 | `database` | `data/quickwork.db` | SQLite path, relative to the configuration directory |
+| `proxy_id` | Empty | Global default: stored proxy ID or `direct`; empty preserves process environment proxy behavior; restart after editing |
 | `api_keys` | `[]` | Allowed inference keys; empty disables inference authentication |
 | `models` | `smart,fast,balanced,auto` | Local model aliases returned by `/v1/models` |
 | `default_model` | `smart` | Fallback mapping for unknown model names |
@@ -313,6 +359,7 @@ Configure inference keys in `api_keys`, then send an allowed key using `Authoriz
 | `quickproxy refresh -account ID` | Refresh one account |
 | `quickproxy logout -all` | Delete all local accounts |
 | `quickproxy logout -account ID` | Delete one local account |
+| `quickproxy version` | Show the build version and source commit without loading configuration |
 
 All commands accept `-config PATH`, defaulting to `config.json`. Running without a subcommand starts the server.
 
@@ -325,6 +372,7 @@ All commands accept `-config PATH`, defaulting to `config.json`. Running without
 | `-timeout` | `config.oauth.timeout` | Login timeout |
 | `-open` | Off | Also open the URL in the default browser |
 | `-manual` | Off | Paste callback URLs instead of opening a callback listener |
+| `-proxy-id` | Empty | Stored proxy ID or `direct`; empty inherits the global default / environment; explicit selection binds the account |
 
 Upgrading from the old Python login flow: `auth/quickauth.py` was removed; `data/session.json` and `data/upstream.json` are no longer read. Sign in again using `quickproxy login`; SQLite is now the account source of truth.
 
@@ -404,7 +452,28 @@ Chat logs report request start, account attempts, upstream event counts, and fin
 | Saved settings do not change behavior | Restart the server; `server -addr` still overrides the listener |
 | Account attempts keep failing | Inspect `quickproxy accounts`; refresh or sign in again for the affected account |
 | Tokens expire | Automatic refresh normally handles this; use `quickproxy refresh` if needed |
+| Social login fails at user information with `net/http: TLS handshake timeout` | See the process-scoped TLS compatibility workaround below; keep default TLS settings unless affected |
 | Container account data appears missing | Use the same volume and `/app/data/config.json`; default DB is `/app/data/data/quickwork.db` |
+
+### TLS Handshake Compatibility
+
+Issue #10 reports that social login failed while fetching user information on macOS arm64 with Go 1.26.11. An independent Go HTTP client also timed out on the same host; disabling hybrid ML-KEM key exchange for that process restored connectivity. This does not establish whether the cause is the AWS endpoint or an intermediary, and it is not a universal fix for TLS timeouts.
+
+If affected, temporarily run both login and the server with this process-scoped setting (POSIX shell):
+
+```sh
+GODEBUG=tlsmlkem=0 ./bin/quickproxy login --provider social -open
+GODEBUG=tlsmlkem=0 ./bin/quickproxy server
+```
+
+In PowerShell, use a child process so the setting does not persist in the current session:
+
+```powershell
+cmd /c "set GODEBUG=tlsmlkem=0&& bin\quickproxy.exe login --provider social -open"
+cmd /c "set GODEBUG=tlsmlkem=0&& bin\quickproxy.exe server"
+```
+
+The project keeps Go's default TLS behavior. This opt-in workaround changes key exchange only; certificate verification remains enabled. If you already use other `GODEBUG` options, retain them in the comma-separated value. Remove the workaround when it is no longer needed. See [Go's TLS compatibility notes](https://go.dev/doc/go1.24#crypto/tls).
 
 ## Layout
 
@@ -416,7 +485,8 @@ quickwork-openai/
   internal/config/         Configuration loading, defaults, persistence
   internal/oauth/          Native OAuth / PKCE, token refresh, user information
   internal/oauth/browser.go Staged callback flow shared with the WebUI
-  internal/store/          SQLite accounts
+  internal/store/          SQLite accounts and proxy inventory / bindings
+  internal/outbound/       Shared HTTP / SOCKS5 outbound routing
   internal/accounts/       Account rotation and automatic refresh
   internal/proxy/          OpenAI handlers, WebSocket protocol, sessions, tools
   config.json              Generated server configuration

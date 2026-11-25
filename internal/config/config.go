@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"quickwork-openai/internal/outbound"
 )
 
 // Duration is a time.Duration encoded as a Go duration string ("5m", "1h").
@@ -64,6 +66,7 @@ type Usage struct {
 type Config struct {
 	Addr             string   `json:"addr"`
 	Database         string   `json:"database"`
+	ProxyID          string   `json:"proxy_id"`
 	APIKeys          []string `json:"api_keys"`
 	Models           []string `json:"models"`
 	DefaultModel     string   `json:"default_model"`
@@ -86,7 +89,8 @@ type Config struct {
 	Usage            Usage    `json:"usage"`
 
 	// Path is the absolute config file path; not serialized.
-	Path string `json:"-"`
+	Path    string           `json:"-"`
+	Proxies *outbound.Router `json:"-"`
 
 	originalDatabase string
 	resolvedDatabase string
@@ -281,6 +285,11 @@ func applyDefaults(c *Config) {
 }
 
 func (c *Config) Validate() error {
+	if c.ProxyID != "" && c.ProxyID != "direct" {
+		if len(c.ProxyID) != 64 || strings.Trim(c.ProxyID, "0123456789abcdef") != "" {
+			return fmt.Errorf("proxy_id must be empty, direct or an ID from the proxy list")
+		}
+	}
 	if c.RequestTimeout <= 0 {
 		return fmt.Errorf("request_timeout must be positive")
 	}

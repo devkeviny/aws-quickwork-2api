@@ -125,6 +125,18 @@ const translations = {
   playgroundKeyOptional: ["API key authentication is disabled, so this field may be empty. Do not enter the management password here.", "此服务未启用 API Key 鉴权，可留空。请勿在此填写管理密码。"],
   confirmDelete: ["Delete account “{name}”? This removes its local credentials. You will need to sign in again.", "确定删除账号“{name}”？这会移除本地凭证，之后需要重新登录。"],
   accountUpdated: ["Account status updated.", "账号状态已更新。"],
+  outboundProxies: ["Outbound proxies", "出站代理"],
+  outboundProxy: ["Outbound proxy", "出站代理"],
+  proxyImportHint: ["Import one http:// or socks5:// URL per line. Stored in SQLite; credentials are never returned to the browser. Imports and account bindings apply immediately. Browser sign-in traffic still uses the browser's own network.", "每行导入一个 http:// 或 socks5:// URL，保存到 SQLite，凭证不会返回浏览器。导入及账号绑定立即生效；浏览器内的登录流量仍使用浏览器自身网络。"],
+  proxyURLs: ["Proxy URLs (one per line)", "代理 URL（每行一个）"],
+  importProxies: ["Import proxies", "导入代理"],
+  proxiesImported: ["Imported {count} new proxies. Duplicates were skipped.", "已导入 {count} 个新代理，重复项已跳过。"],
+  inheritProxy: ["Inherit default / environment", "继承默认／环境代理"],
+  directProxy: ["Direct (ignore proxy environment)", "直连（忽略环境代理）"],
+  missingProxy: ["Bound proxy unavailable", "绑定代理不可用"],
+  proxyRejected: ["Invalid proxy. Use a stored HTTP/SOCKS5 proxy, inherit, or direct.", "代理无效，请使用已保存的 HTTP/SOCKS5 代理、继承或直连。"],
+  proxyInUse: ["Unbind this proxy from accounts and default settings before deleting it.", "请先解除账号绑定及默认设置，再删除此代理。"],
+  confirmDeleteProxy: ["Delete proxy {name}?", "删除代理 {name}？"],
   accountID: ["Account #{id}", "账号 #{id}"],
   noRegion: ["No region specified", "未指定区域"],
   hasError: ["Has error", "存在错误"],
@@ -257,6 +269,9 @@ const apiErrorTranslations = {
   login_not_found: "loginNotFound",
   config_save_failed: "configSaveFailed",
   database_error: "databaseError",
+  invalid_proxy: "proxyRejected",
+  proxy_not_found: "proxyRejected",
+  proxy_in_use: "proxyInUse",
   usage_unavailable: "usageUnavailable",
   usage_unauthorized: "usageUnauthorized",
   usage_failed: "usageFailed",
@@ -345,6 +360,7 @@ function setLanguage(value) {
   setTranslation(elements["page-title"], pageTitles[state.page]);
   if (state.status) renderStatus(state.status);
   if (state.authenticated) renderAccounts();
+  if (state.authenticated) renderProxies();
   if (state.config) renderConfigMetadata(state.config);
   if (state.login) renderLogin(state.login);
 }
@@ -360,6 +376,7 @@ const state = {
   status: null,
   config: null,
   accounts: [],
+  proxies: [],
   login: null,
   loginRevision: 0,
   playgroundController: null
@@ -408,6 +425,7 @@ function clearSession() {
   state.status = null;
   state.config = null;
   state.accounts = [];
+  state.proxies = [];
   state.login = null;
   elements["login-password"].value = "";
   elements["playground-api-key"].value = "";
@@ -421,6 +439,9 @@ function clearSession() {
   elements["replacement-api-keys"].disabled = false;
   elements["oauth-callback"].value = "";
   elements["oauth-region"].value = "";
+  elements["proxy-import-text"].value = "";
+  elements["oauth-proxy"].replaceChildren();
+  elements["proxy-list"].replaceChildren();
   elements["oauth-link"].removeAttribute("href");
   elements["oauth-flow"].hidden = true;
   for (const id of ["start-login", "submit-callback", "check-login", "cancel-login"]) elements[id].disabled = false;
@@ -632,11 +653,80 @@ function makeAccountAction(label, action, account, danger = false) {
 
 async function loadAccounts() {
   const generation = state.generation;
-  const data = await requestJSON("/api/accounts");
+  const [data, proxyData] = await Promise.all([requestJSON("/api/accounts"), requestJSON("/api/proxies")]);
   if (!state.authenticated || generation !== state.generation) return;
   state.accounts = data.accounts || [];
+  state.proxies = proxyData.proxies || [];
+  renderProxies();
   renderAccounts();
 }
+
+function proxySelect(selected) {
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", translate("outboundProxy"));
+  for (const proxy of [{ id: "", label: translate("inheritProxy") }, { id: "direct", label: translate("directProxy") }, ...state.proxies]) {
+    const option = textElement("option", `${proxy.label}${proxy.id && proxy.id !== "direct" ? ` · ${proxy.id.slice(0, 8)}` : ""}`);
+    option.value = proxy.id;
+    select.append(option);
+  }
+  if (selected && selected !== "direct" && !state.proxies.some(proxy => proxy.id === selected)) {
+    const option = textElement("option", translate("missingProxy"));
+    option.value = selected;
+    select.append(option);
+  }
+  select.value = selected || "";
+  return select;
+}
+
+function renderProxies() {
+  const selected = elements["oauth-proxy"].value;
+  const loginProxy = proxySelect(selected);
+  elements["oauth-proxy"].replaceChildren(...loginProxy.children);
+  elements["oauth-proxy"].value = selected;
+  elements["proxy-list"].replaceChildren(...state.proxies.map(proxy => {
+    const item = textElement("div", "", "credit-item proxy-item");
+    const details = textElement("div");
+    details.append(textElement("div", proxy.label), textElement("code", proxy.id));
+    item.append(details);
+    const button = textElement("button", translate("delete"), "button small subtle danger");
+    button.type = "button";
+    button.addEventListener("click", async () => {
+      const generation = state.generation;
+      if (!window.confirm(translate("confirmDeleteProxy", { name: proxy.label }))) return;
+      button.disabled = true;
+      try {
+        await requestJSON(`/api/proxies/${encodeURIComponent(proxy.id)}`, { method: "DELETE" });
+        if (!state.authenticated || generation !== state.generation) return;
+        await loadAccounts();
+      } catch (error) {
+        if (state.authenticated && generation === state.generation) reportError(error);
+      } finally {
+        button.disabled = false;
+      }
+    });
+    item.append(button);
+    return item;
+  }));
+}
+
+elements["proxy-import-form"].addEventListener("submit", async event => {
+  event.preventDefault();
+  const generation = state.generation;
+  const button = elements["import-proxies"];
+  button.disabled = true;
+  const proxies = elements["proxy-import-text"].value;
+  elements["proxy-import-text"].value = "";
+  try {
+    const result = await requestJSON("/api/proxies/import", { method: "POST", body: { proxies } });
+    if (!state.authenticated || generation !== state.generation) return;
+    await loadAccounts();
+    if (state.authenticated && generation === state.generation) showMessage("proxiesImported", "success", { count: result.imported });
+  } catch (error) {
+    if (state.authenticated && generation === state.generation) reportError(error);
+  } finally {
+    button.disabled = false;
+  }
+});
 
 function renderAccounts() {
   const rows = state.accounts.map(account => {
@@ -647,6 +737,22 @@ function renderAccounts() {
     const provider = document.createElement("td");
     provider.append(textElement("div", `${account.provider || "—"} / ${account.build_stage || "prod"}`));
     provider.append(textElement("div", account.region || translate("noRegion"), "cell-note"));
+    const binding = proxySelect(account.proxy_id);
+    binding.addEventListener("change", async () => {
+      const generation = state.generation;
+      binding.disabled = true;
+      try {
+        await requestJSON(`/api/accounts/${encodeURIComponent(account.id)}`, { method: "PATCH", body: { proxy_id: binding.value } });
+        if (!state.authenticated || generation !== state.generation) return;
+        account.proxy_id = binding.value;
+      } catch (error) {
+        binding.value = account.proxy_id || "";
+        if (state.authenticated && generation === state.generation) reportError(error);
+      } finally {
+        binding.disabled = false;
+      }
+    });
+    provider.append(binding);
     const status = document.createElement("td");
     const badges = textElement("div", "", "status-badges");
     badges.append(textElement("span", translate(account.disabled ? "disabled" : "enabled"), `badge${account.disabled ? " neutral" : ""}`));
@@ -939,7 +1045,7 @@ elements["upstream-login-form"].addEventListener("submit", async event => {
     if (!state.authenticated || revision !== state.loginRevision) return;
     const flow = await requestJSON("/api/logins", {
       method: "POST",
-      body: { provider: elements["oauth-provider"].value, stage: elements["oauth-stage"].value, region: elements["oauth-region"].value.trim() }
+      body: { provider: elements["oauth-provider"].value, stage: elements["oauth-stage"].value, region: elements["oauth-region"].value.trim(), proxy_id: elements["oauth-proxy"].value }
     });
     if (!state.authenticated || revision !== state.loginRevision) return;
     for (const id of ["submit-callback", "check-login", "cancel-login"]) elements[id].disabled = false;

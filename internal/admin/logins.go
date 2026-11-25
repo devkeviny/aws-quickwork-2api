@@ -14,6 +14,7 @@ func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 		Provider string `json:"provider"`
 		Stage    string `json:"stage"`
 		Region   string `json:"region"`
+		ProxyID  string `json:"proxy_id"`
 	}
 	if !decodeJSON(w, r, &input, 4<<10) {
 		return
@@ -46,8 +47,13 @@ func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_region", "Region may only contain lowercase letters, digits and hyphens")
 		return
 	}
+	if !s.cfg.Proxies.Has(input.ProxyID) {
+		writeError(w, http.StatusBadRequest, "invalid_proxy", "Select an available proxy")
+		return
+	}
 	flow, err := oauth.NewBrowserLogin(oauth.LoginOptions{
 		Provider: input.Provider, Stage: input.Stage, Region: input.Region,
+		ProxyID: input.ProxyID, Proxies: s.cfg.Proxies,
 		Port: s.cfg.OAuth.CallbackPort, Timeout: s.cfg.OAuth.Timeout.Duration(), AppVersion: s.cfg.AppVersion,
 	}, s.store)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"quickwork-openai/internal/config"
+	"quickwork-openai/internal/outbound"
 	"quickwork-openai/internal/store"
 )
 
@@ -16,6 +17,8 @@ type Session struct {
 	WSPath           string
 	TenantURL        string
 	Provider         string
+	ProxyID          string
+	Proxies          *outbound.Router
 	ActorARN         string
 	Surface          string
 	OutpostID        string
@@ -41,6 +44,8 @@ func SessionFromAccount(a *store.Account, cfg *config.Config) *Session {
 		WSPath:           a.WSPath,
 		TenantURL:        a.TenantURL,
 		Provider:         a.Provider,
+		ProxyID:          a.ProxyID,
+		Proxies:          cfg.Proxies,
 		ActorARN:         a.ActorARN,
 		Surface:          surface,
 		OutpostID:        cfg.OutpostID,

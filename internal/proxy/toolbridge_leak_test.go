@@ -78,3 +78,96 @@ func TestLeakBlocksNonJSONKept(t *testing.T) {
 		t.Errorf("bloco não-JSON foi apagado: %q", clean)
 	}
 }
+
+// Os blocos que vazaram em 24/nov 22:35 e 22:43 vieram de turnos SEM
+// tools (bridge desligado): a limpeza antiga só rodava com o bridge.
+// Com allowed vazio, o bloco some do texto do mesmo jeito.
+func TestLeakBlocksNoTools(t *testing.T) {
+	allowed := map[string]bool{}
+
+	block2243 := `<client_tool_call>{"name":"tool_call","arguments":{"calls":[{"name":"update_task_status","arguments":{"mission_id":"regras-globais-2026-11-24","role":"Coder","status":"DONE","task":"AGENTS.md criado e enviado (fc35ffc em origin/main)","force_now":true},{"name":"update_task_status","arguments":{"mission_id":"regras-globais-2026-11-24","role":"Platform","status":"BLOCKED","task":"Limpeza de worktrees aguardando aprovação do Kevinny; painel em teste","force_now":true}]}}</client_tool_call>`
+	clean, replies := parseClientToolCalls(block2243, allowed)
+	if len(replies) != 0 {
+		t.Errorf("sem tools: esperava 0 replies, veio %d", len(replies))
+	}
+	if strings.Contains(clean, "client_tool_call") || strings.Contains(clean, "update_task_status") {
+		t.Errorf("bloco 22:43 vazou sem tools: %q", clean)
+	}
+	if clean != "" {
+		t.Errorf("bloco 22:43 sozinho deveria sumir, sobrou: %q", clean)
+	}
+
+	prose := `The latest part of the file probably holds the tool result. I'll read the end.` + block2243
+	clean2, _ := parseClientToolCalls(prose, allowed)
+	if strings.Contains(clean2, "client_tool_call") {
+		t.Errorf("bloco 22:35 vazou sem tools: %q", clean2)
+	}
+	if !strings.Contains(clean2, "The latest part") {
+		t.Errorf("prosa ao redor do bloco foi perdida: %q", clean2)
+	}
+}
+
+func TestLeakBlocksUnclosedTagDropped(t *testing.T) {
+	// Bloco truncado (sem a tag de fechamento) não vaza: some com o resto.
+	allowed := map[string]bool{"terminal": true}
+	text := `Antes <client_tool_call>{"name":"terminal","arguments":{"command":"echo`
+	clean, _ := parseClientToolCalls(text, allowed)
+	if strings.Contains(clean, "client_tool_call") {
+		t.Errorf("tag sem fechamento vazou: %q", clean)
+	}
+	if !strings.Contains(clean, "Antes") {
+		t.Errorf("prosa antes da tag foi perdida: %q", clean)
+	}
+}
+
+func TestStreamScrubberSplitBlock(t *testing.T) {
+	// O texto do 22:35 chegando em 3 pedaços, com o bloco partido no meio
+	// da tag, do JSON e do fechamento.
+	allowed := map[string]bool{}
+	chunks := []string{
+		`The latest part of the file probably holds the tool result. I'll read the end.<client_to`,
+		`ol_call>{"name":"tool_call","arguments":{"calls":[{"name":"update_task_status","arguments":{"mission_id":"regras-globais-2026-11-24","role":"Coder","status":"DONE"`,
+		`,"task":"AGENTS.md criado e enviado (fc35ffc em origin/main)","force_now":true}}]}}</client_tool_call> FIM.`,
+	}
+	s := newStreamScrubber(allowed)
+	var out strings.Builder
+	for _, c := range chunks {
+		out.WriteString(s.push(c))
+	}
+	out.WriteString(s.flush())
+	got := out.String()
+	if strings.Contains(got, "client_tool_call") || strings.Contains(got, "update_task_status") {
+		t.Errorf("bloco partido vazou no stream: %q", got)
+	}
+	if !strings.Contains(got, "The latest part") || !strings.Contains(got, "FIM.") {
+		t.Errorf("prosa ao redor do bloco foi perdida: %q", got)
+	}
+}
+
+func TestStreamScrubberBlockOnly(t *testing.T) {
+	// Resposta que é SÓ o bloco (caso 22:43): nada sai.
+	allowed := map[string]bool{}
+	block := `<client_tool_call>{"name":"tool_call","arguments":{"calls":[{"name":"update_task_status","arguments":{"mission_id":"regras-globais-2026-11-24","role":"Platform","status":"BLOCKED","force_now":true}}]}}</client_tool_call>`
+	s := newStreamScrubber(allowed)
+	var out strings.Builder
+	mid := len(block) / 2
+	out.WriteString(s.push(block[:mid]))
+	out.WriteString(s.push(block[mid:]))
+	out.WriteString(s.flush())
+	if got := out.String(); got != "" {
+		t.Errorf("bloco sozinho deveria sumir, saiu: %q", got)
+	}
+}
+
+func TestStreamScrubberAngleBracket(t *testing.T) {
+	// "<" comum em prosa passa intacto.
+	allowed := map[string]bool{}
+	s := newStreamScrubber(allowed)
+	var out strings.Builder
+	out.WriteString(s.push("a < b and 5 < 10, x <"))
+	out.WriteString(s.push(" y, fim."))
+	out.WriteString(s.flush())
+	if got := out.String(); got != "a < b and 5 < 10, x < y, fim." {
+		t.Errorf("prosa com < foi alterada: %q", got)
+	}
+}

@@ -190,14 +190,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	responseOutput := func(result ChatResult) (string, []ToolCall) {
 		text := result.Text
-		var replies []ToolCallReply
-		if bridgeActive {
-			text, replies = parseClientToolCalls(text, allowedTools)
-			if len(replies) == 0 {
-				replies = nativeToolReplies(result.ToolCalls, allowedTools)
-			}
-			replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
+		// Always strip machine-protocol markers, even when this request
+		// carried no tools: the model can still emit <client_tool_call>
+		// blocks (imitating earlier turns), and without the bridge the
+		// raw markup would reach the caller verbatim.
+		text, replies := parseClientToolCalls(text, allowedTools)
+		if !bridgeActive {
+			return text, nil
 		}
+		if len(replies) == 0 {
+			replies = nativeToolReplies(result.ToolCalls, allowedTools)
+		}
+		replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
 		return text, replyToolCalls(replies)
 	}
 	blockedAccounts := make(map[int64]bool)
@@ -460,8 +464,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	sawVisibleText := false
 	var pendingText strings.Builder
+	scrubber := newStreamScrubber(allowedTools)
 	res, lastErr := runChat(func(ev StreamEvent) error {
 		if ev.Type != "text" || ev.Text == "" || bridgeActive {
+			return nil
+		}
+		// Scrub live text even without the bridge: a no-tools turn can
+		// still carry <client_tool_call> blocks.
+		ev.Text = scrubber.push(ev.Text)
+		if ev.Text == "" {
 			return nil
 		}
 		if !sawVisibleText {
@@ -481,6 +492,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}, func() {
 		sawVisibleText = false
 		pendingText.Reset()
+		scrubber.reset()
 	})
 	if lastErr != nil {
 		conv.reset()
@@ -510,8 +522,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if len(outTools) > 0 {
 			finish = "tool_calls"
 		}
-	} else if !sawVisibleText && hasVisibleText(res.Text) {
-		outText = res.Text
+	} else {
+		// Text already streamed live (scrubbed); flush any held tail.
+		// When nothing streamed yet, fall back to the cleaned full
+		// result (covers whitespace-only streams).
+		outText = scrubber.flush()
+		if !sawVisibleText && !hasVisibleText(outText) {
+			outText, _ = responseOutput(res)
+		}
 	}
 	if hasVisibleText(outText) {
 		writeChunk(map[string]any{"content": outText}, nil)

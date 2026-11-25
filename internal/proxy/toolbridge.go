@@ -245,14 +245,12 @@ func nestedCallEnvelopes(args json.RawMessage) []toolCallEnvelope {
 	return holder.ToolCalls
 }
 
-// isJSONObjectOrArray reports whether s is valid JSON shaped as an object or
-// an array.
-func isJSONObjectOrArray(s string) bool {
+// looksLikeJSON reports whether s starts like a JSON value. A malformed
+// tool-call body (missing brace, truncated) is still machine protocol,
+// never prose, so it is dropped like valid JSON.
+func looksLikeJSON(s string) bool {
 	t := strings.TrimSpace(s)
-	if t == "" || (t[0] != '{' && t[0] != '[') {
-		return false
-	}
-	return json.Valid([]byte(t))
+	return t != "" && (t[0] == '{' || t[0] == '[')
 }
 
 // parseToolEnvelopes accepts a single object, an array, an OpenAI tool_calls
@@ -389,14 +387,17 @@ func extractTaggedToolCalls(text string, allowed map[string]bool) (string, []Too
 		bodyStart := start + len(open)
 		relEnd := strings.Index(rest[bodyStart:], close)
 		if relEnd < 0 {
-			clean.WriteString(rest)
+			// Unclosed marker (truncated output): drop it and everything
+			// after it instead of leaking raw markup.
+			clean.WriteString(rest[:start])
+			changed = true
 			break
 		}
 		bodyEnd := bodyStart + relEnd
 		parsed := repliesFromEnvelopes(parseToolEnvelopes(rest[bodyStart:bodyEnd]), allowed)
 		if len(parsed) == 0 {
 			clearEnd := bodyEnd + len(close)
-			if isJSONObjectOrArray(rest[bodyStart:bodyEnd]) {
+			if looksLikeJSON(rest[bodyStart:bodyEnd]) {
 				clean.WriteString(rest[:start])
 				changed = true
 				rest = rest[clearEnd:]
@@ -495,7 +496,27 @@ func extractBareToolCall(text string, allowed map[string]bool) (string, []ToolCa
 	return "", replies
 }
 
+// dropTrailingPartialTag removes a trailing fragment of a tag open
+// ("<client_tool_" at end of text): a truncated marker, never prose.
+func dropTrailingPartialTag(s string) string {
+	i := strings.LastIndexByte(s, '<')
+	if i < 0 {
+		return s
+	}
+	tail := strings.TrimRight(s[i:], " \t\r\n")
+	if len(tail) < 2 {
+		return s
+	}
+	for _, pair := range toolTagPairs {
+		if strings.HasPrefix(pair[0], tail) {
+			return strings.TrimRight(s[:i], " \t\r\n")
+		}
+	}
+	return s
+}
+
 func parseClientToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply) {
+	text = dropTrailingPartialTag(text)
 	clean, replies := extractTaggedToolCalls(text, allowed)
 	if len(replies) > 0 || clean != text {
 		return dropEmptyFences(clean), replies
@@ -505,6 +526,80 @@ func parseClientToolCalls(text string, allowed map[string]bool) (string, []ToolC
 		return clean, replies
 	}
 	return extractBareToolCall(text, allowed)
+}
+
+// streamScrubber strips <client_tool_call> (and sibling) markers from a
+// live text stream. Text is released only once it can no longer be part
+// of an unclosed marker, so a block split across chunks is still caught.
+// Feed each chunk with push and call flush at end of stream.
+type streamScrubber struct {
+	allowed map[string]bool
+	pending strings.Builder
+}
+
+func newStreamScrubber(allowed map[string]bool) *streamScrubber {
+	return &streamScrubber{allowed: allowed}
+}
+
+func (s *streamScrubber) reset() {
+	s.pending.Reset()
+}
+
+// toolTagPairs lists the marker pairs the scrubber watches, open + close.
+var toolTagPairs = [][2]string{
+	{clientToolCallOpen, clientToolCallClose},
+	{genericToolCallOpen, genericToolCallClose},
+	{functionCallOpen, functionCallClose},
+}
+
+// holdIndex returns the earliest byte index from which buf must be held:
+// a '<' starting a tag open (complete or partial) whose closing tag has
+// not arrived yet. It returns -1 when nothing needs holding.
+func holdIndex(buf string) int {
+	for i := 0; i < len(buf); i++ {
+		if buf[i] != '<' {
+			continue
+		}
+		rest := buf[i:]
+		for _, pair := range toolTagPairs {
+			open, close := pair[0], pair[1]
+			if strings.HasPrefix(rest, open) {
+				// Complete open: hold unless its close already arrived.
+				if strings.Index(rest[len(open):], close) < 0 {
+					return i
+				}
+				break
+			}
+			// Partial open at the end of the buffer: hold.
+			if len(rest) < len(open) && strings.HasPrefix(open, rest) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// push feeds one chunk and returns the clean text safe to emit now.
+func (s *streamScrubber) push(chunk string) string {
+	s.pending.WriteString(chunk)
+	buf := s.pending.String()
+	if hold := holdIndex(buf); hold >= 0 {
+		clean, _ := parseClientToolCalls(buf[:hold], s.allowed)
+		rest := buf[hold:]
+		s.pending.Reset()
+		s.pending.WriteString(rest)
+		return clean
+	}
+	clean, _ := parseClientToolCalls(buf, s.allowed)
+	s.pending.Reset()
+	return clean
+}
+
+// flush releases the remainder at end of stream.
+func (s *streamScrubber) flush() string {
+	clean, _ := parseClientToolCalls(s.pending.String(), s.allowed)
+	s.pending.Reset()
+	return clean
 }
 
 // limitToolReplies enforces tool_choice/parallel_tool_calls limits.
